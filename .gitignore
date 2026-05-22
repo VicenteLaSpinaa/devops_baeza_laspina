@@ -1,15 +1,7 @@
-# ============================================================
-# .gitignore — Raíz del Proyecto Semestral
-# ============================================================
-# Este archivo le indica a Git qué archivos y carpetas NO debe
-# rastrear ni subir al repositorio remoto (GitHub).
-# ============================================================
 
-# ==================== JAVA / SPRING BOOT ====================
-# Carpeta donde Maven deposita el .jar compilado y archivos temporales
 **/target/
 
-# Archivos de configuración de IDEs (IntelliJ IDEA, Eclipse, VS Code)
+
 **/.idea/
 **/.vscode/
 **/.settings/
@@ -17,32 +9,32 @@
 **/.classpath
 **/.project
 
-# Wrapper de Maven (ya está en el repo, pero los archivos descargados no)
+
 **/.mvn/wrapper/maven-wrapper.jar
 
-# ==================== NODE.JS / REACT ====================
-# Dependencias de Node.js (~200MB). Se reinstalan con npm install.
 **/node_modules/
 
-# Carpeta de build generada por Vite. Se regenera con npm run build.
+
 **/dist/
 
-# ==================== VARIABLES DE ENTORNO ====================
-# Archivos .env contienen contraseñas, claves API y secretos.
-# NUNCA deben subirse a un repositorio público.
+
 **/.env
 **/.env.local
 **/.env.*.local
 
-# ==================== SISTEMA OPERATIVO ====================
-# Archivos de metadatos que macOS crea automáticamente en cada carpeta
 **/.DS_Store
 
-# Archivos de miniatura de Windows
+
 **/Thumbs.db
 
-# ==================== LOGS Y TEMPORALES ====================
 *.log
 npm-debug.log*
 *.swp
 *~
+
+# Claves SSH privadas (NUNCA deben subirse al repositorio)
+*.pem
+*.key
+
+# Archivos de salida de CloudFormation
+infra/outputs/

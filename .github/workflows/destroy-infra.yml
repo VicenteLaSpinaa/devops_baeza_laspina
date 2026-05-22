@@ -1,0 +1,90 @@
+
+# PELIGRO: Este workflow elimina permanentemente:
+#   - Las 5 instancias EC2 y sus datos
+#   - La VPC, subnets y security groups
+#   - El key pair SSH
+#   - El parámetro SSM con la clave
+#
+# Se requiere escribir "destroy" para confirmar la acción.
+# Solo se ejecuta manualmente (workflow_dispatch).
+
+
+
+name: 'Destroy Infrastructure'
+
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Escribe "destroy" para confirmar la eliminación'
+        required: true
+        type: string
+
+
+env:
+  AWS_REGION: us-east-1
+  STACK_NAME: devops-baeza-laspina
+  KEY_PAIR_NAME: devops-deploy-key
+  SSM_KEY_PARAM: /devops/deploy-key
+
+
+jobs:
+  destroy:
+    name: 'Destruir Infraestructura'
+    runs-on: ubuntu-latest
+    # Solo se ejecuta si el usuario escribió "destroy"
+    if: github.event.inputs.confirm == 'destroy'
+
+    steps:
+      - name: Configurar credenciales AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Eliminar stack CloudFormation
+        run: |
+          echo "Eliminando stack '${{ env.STACK_NAME }}'..."
+          echo "   Esto eliminará: VPC, Subnets, Security Groups, 5x EC2"
+          echo ""
+
+          # Verificar que el stack existe
+          if ! aws cloudformation describe-stacks \
+            --stack-name ${{ env.STACK_NAME }} > /dev/null 2>&1; then
+            echo "El stack no existe. Nada que eliminar."
+          else
+            # Eliminar el stack
+            aws cloudformation delete-stack \
+              --stack-name ${{ env.STACK_NAME }}
+
+            echo "Esperando eliminación del stack (puede tardar ~5 min)..."
+            aws cloudformation wait stack-delete-complete \
+              --stack-name ${{ env.STACK_NAME }}
+
+            echo "Stack eliminado"
+          fi
+
+      - name: Limpiar Key Pair y SSM
+        run: |
+          echo "Limpiando recursos residuales..."
+
+          # Eliminar key pair
+          aws ec2 delete-key-pair \
+            --key-name ${{ env.KEY_PAIR_NAME }} 2>/dev/null || true
+          echo "  Key pair eliminado"
+
+          # Eliminar parámetro SSM
+          aws ssm delete-parameter \
+            --name ${{ env.SSM_KEY_PARAM }} 2>/dev/null || true
+          echo "  Parámetro SSM eliminado"
+
+          echo ""
+          echo "============================================"
+          echo "  INFRAESTRUCTURA ELIMINADA"
+          echo "============================================"
+          echo "  Todos los recursos AWS han sido eliminados."
+          echo "  Para redesplegar, ejecuta 'Deploy Infrastructure'."
+          echo "============================================"

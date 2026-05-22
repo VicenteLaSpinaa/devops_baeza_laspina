@@ -1,0 +1,405 @@
+# Despliega la aplicación (React, Spring Boot y MySQL) en las instancias EC2.
+# Se ejecuta de forma automática al hacer push a 'main' o de forma manual.
+# Requiere tener la infraestructura previamente creada y los secrets de AWS configurados.
+
+
+name: 'Deploy Application'
+
+
+on:
+  # Se ejecuta automáticamente en push a main
+  push:
+    branches: [main]
+  # También se puede ejecutar manualmente
+  workflow_dispatch:
+
+
+env:
+  AWS_REGION: us-east-1
+  STACK_NAME: devops-baeza-laspina
+  SSM_KEY_PARAM: /devops/deploy-key
+  SSH_OPTS: '-o StrictHostKeyChecking=no -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=5'
+
+
+jobs:
+  deploy-application:
+    name: 'Desplegar Aplicación'
+    runs-on: ubuntu-latest
+
+    steps:
+
+
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Configurar credenciales AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verificar infraestructura
+        run: |
+          if ! aws cloudformation describe-stacks --stack-name ${{ env.STACK_NAME }} > /dev/null 2>&1; then
+            echo "Error: no se encontró la infraestructura."
+            echo "Ejecuta primero el workflow 'Deploy Infrastructure'."
+            exit 1
+          fi
+
+          STACK_STATUS=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.STACK_NAME }} \
+            --query 'Stacks[0].StackStatus' --output text)
+
+          if [[ "$STACK_STATUS" != *"COMPLETE"* ]]; then
+            echo "Error: el stack está en estado $STACK_STATUS."
+            echo "Espera a que termine o recrea el stack."
+            exit 1
+          fi
+
+          echo "Infraestructura lista (estado: $STACK_STATUS)"
+
+      - name: Obtener clave SSH
+        run: |
+          aws ssm get-parameter \
+            --name ${{ env.SSM_KEY_PARAM }} \
+            --query 'Parameter.Value' \
+            --output text > key.pem
+
+          chmod 400 key.pem
+          echo "Clave SSH descargada"
+
+      - name: Obtener IPs de las instancias
+        id: ips
+        run: |
+          get_output() {
+            aws cloudformation describe-stacks \
+              --stack-name ${{ env.STACK_NAME }} \
+              --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" \
+              --output text
+          }
+
+          # IPs públicas (para SSH desde GitHub Actions)
+          echo "FRONTEND_PUBLIC=$(get_output FrontendPublicIP)" >> $GITHUB_OUTPUT
+          echo "BV_PUBLIC=$(get_output BackendVentasPublicIP)" >> $GITHUB_OUTPUT
+          echo "BD_PUBLIC=$(get_output BackendDespachosPublicIP)" >> $GITHUB_OUTPUT
+          echo "DBV_PUBLIC=$(get_output MySQLVentasPublicIP)" >> $GITHUB_OUTPUT
+          echo "DBD_PUBLIC=$(get_output MySQLDespachosPublicIP)" >> $GITHUB_OUTPUT
+
+          # IPs privadas (para comunicación entre servicios dentro de la VPC)
+          echo "BV_PRIVATE=$(get_output BackendVentasPrivateIP)" >> $GITHUB_OUTPUT
+          echo "BD_PRIVATE=$(get_output BackendDespachosPrivateIP)" >> $GITHUB_OUTPUT
+          echo "DBV_PRIVATE=$(get_output MySQLVentasPrivateIP)" >> $GITHUB_OUTPUT
+          echo "DBD_PRIVATE=$(get_output MySQLDespachosPrivateIP)" >> $GITHUB_OUTPUT
+
+          echo "IPs detectadas:"
+          echo "  Frontend:  $(get_output FrontendPublicIP)"
+          echo "  Backend V: $(get_output BackendVentasPublicIP)"
+          echo "  Backend D: $(get_output BackendDespachosPublicIP)"
+          echo "  MySQL V:   $(get_output MySQLVentasPublicIP)"
+          echo "  MySQL D:   $(get_output MySQLDespachosPublicIP)"
+
+
+      - name: Esperar instancias listas
+        run: |
+          wait_for_instance() {
+            local IP=$1
+            local NAME=$2
+            local MAX=40
+
+            echo "Comprobando conexión con $NAME ($IP)..."
+            for i in $(seq 1 $MAX); do
+              if ssh ${{ env.SSH_OPTS }} -i key.pem ec2-user@$IP \
+                'test -f /home/ec2-user/.setup-complete && docker info > /dev/null 2>&1' 2>/dev/null; then
+                echo "  $NAME está listo"
+                return 0
+              fi
+              echo "  Intento $i/$MAX... esperando 15 segundos"
+              sleep 15
+            done
+            echo "  Excedido el tiempo de espera para $NAME"
+            return 1
+          }
+
+          wait_for_instance "${{ steps.ips.outputs.DBV_PUBLIC }}" "MySQL Ventas"
+          wait_for_instance "${{ steps.ips.outputs.DBD_PUBLIC }}" "MySQL Despachos"
+          wait_for_instance "${{ steps.ips.outputs.BV_PUBLIC }}" "Backend Ventas"
+          wait_for_instance "${{ steps.ips.outputs.BD_PUBLIC }}" "Backend Despachos"
+          wait_for_instance "${{ steps.ips.outputs.FRONTEND_PUBLIC }}" "Frontend"
+
+          echo ""
+          echo "Todas las instancias responden por SSH"
+
+
+      - name: Desplegar MySQL Ventas
+        run: |
+          IP="${{ steps.ips.outputs.DBV_PUBLIC }}"
+          echo "Instalando MySQL Ventas en $IP..."
+
+          ssh ${{ env.SSH_OPTS }} -i key.pem ec2-user@$IP << 'EOF'
+          # Detener contenedor existente si lo hay
+          docker stop mysql-ventas 2>/dev/null || true
+          docker rm mysql-ventas 2>/dev/null || true
+
+          # Ejecutar MySQL con volumen persistente
+          docker run -d \
+            --name mysql-ventas \
+            --restart unless-stopped \
+            -p 3306:3306 \
+            -v mysql-ventas-data:/var/lib/mysql \
+            -e MYSQL_ROOT_PASSWORD=root_password_ventas \
+            -e MYSQL_DATABASE=db_ventas \
+            -e MYSQL_USER=user_ventas \
+            -e MYSQL_PASSWORD=pass_ventas \
+            mysql:8.0
+
+          echo "MySQL Ventas iniciado"
+          EOF
+
+      - name: Desplegar MySQL Despachos
+        run: |
+          IP="${{ steps.ips.outputs.DBD_PUBLIC }}"
+          echo "Instalando MySQL Despachos en $IP..."
+
+          ssh ${{ env.SSH_OPTS }} -i key.pem ec2-user@$IP << 'EOF'
+          docker stop mysql-despachos 2>/dev/null || true
+          docker rm mysql-despachos 2>/dev/null || true
+
+          docker run -d \
+            --name mysql-despachos \
+            --restart unless-stopped \
+            -p 3306:3306 \
+            -v mysql-despachos-data:/var/lib/mysql \
+            -e MYSQL_ROOT_PASSWORD=root_password_despachos \
+            -e MYSQL_DATABASE=db_despachos \
+            -e MYSQL_USER=user_despachos \
+            -e MYSQL_PASSWORD=pass_despachos \
+            mysql:8.0
+
+          echo "MySQL Despachos iniciado"
+          EOF
+
+
+      - name: Esperar MySQL saludable
+        run: |
+          wait_mysql() {
+            local IP=$1
+            local NAME=$2
+            local CONTAINER=$3
+            local ROOT_PASS=$4
+            local MAX=30
+
+            echo "Verificando que $NAME acepte conexiones..."
+            for i in $(seq 1 $MAX); do
+              if ssh ${{ env.SSH_OPTS }} -i key.pem ec2-user@$IP \
+                "docker exec $CONTAINER mysqladmin ping -h localhost -u root -p$ROOT_PASS --silent" 2>/dev/null; then
+                echo "  $NAME está listo"
+                return 0
+              fi
+              echo "  Intento $i/$MAX... reintentando en 10s"
+              sleep 10
+            done
+            echo "  Timeout: $NAME no respondió"
+            return 1
+          }
+
+          wait_mysql "${{ steps.ips.outputs.DBV_PUBLIC }}" "MySQL Ventas" "mysql-ventas" "root_password_ventas"
+          wait_mysql "${{ steps.ips.outputs.DBD_PUBLIC }}" "MySQL Despachos" "mysql-despachos" "root_password_despachos"
+
+          echo ""
+          echo "Bases de datos listas para usar"
+
+
+
+
+      - name: Empaquetar Backend Ventas
+        run: |
+          tar -czf /tmp/backend-ventas.tar.gz \
+            -C back-Ventas_SpringBoot/Springboot-API-REST .
+          echo "Backend Ventas comprimido ($(du -h /tmp/backend-ventas.tar.gz | cut -f1))"
+
+      - name: Desplegar Backend Ventas
+        run: |
+          IP="${{ steps.ips.outputs.BV_PUBLIC }}"
+          DB_IP="${{ steps.ips.outputs.DBV_PRIVATE }}"
+          echo "Desplegando Backend Ventas en $IP (DB: $DB_IP)..."
+
+          # Subir código al EC2
+          scp ${{ env.SSH_OPTS }} -i key.pem \
+            /tmp/backend-ventas.tar.gz ec2-user@$IP:~/
+
+          # Construir y ejecutar en el EC2
+          ssh ${{ env.SSH_OPTS }} -i key.pem ec2-user@$IP << DEPLOY
+          set -e
+
+          # Preparar directorio
+          mkdir -p ~/app
+          cd ~/app
+          rm -rf ./* ./.[!.]* 2>/dev/null || true
+          tar -xzf ~/backend-ventas.tar.gz
+
+          # Detener contenedor existente
+          docker stop backend-ventas 2>/dev/null || true
+          docker rm backend-ventas 2>/dev/null || true
+
+          # Construir imagen Docker (multi-stage: Maven build + JRE runtime)
+          echo "Compilando la imagen de Docker (suele tomar unos 5 minutos)..."
+          docker build -t backend-ventas .
+
+          # Ejecutar contenedor
+          docker run -d \
+            --name backend-ventas \
+            --restart unless-stopped \
+            -p 8080:8080 \
+            -e DB_ENDPOINT=${DB_IP} \
+            -e DB_PORT=3306 \
+            -e DB_NAME=db_ventas \
+            -e DB_USERNAME=user_ventas \
+            -e DB_PASSWORD=pass_ventas \
+            -e SERVER_PORT=8080 \
+            backend-ventas
+
+          echo "Backend Ventas corriendo"
+          DEPLOY
+
+      - name: Empaquetar Backend Despachos
+        run: |
+          tar -czf /tmp/backend-despachos.tar.gz \
+            -C back-Despachos_SpringBoot/Springboot-API-REST-DESPACHO .
+          echo "Backend Despachos comprimido ($(du -h /tmp/backend-despachos.tar.gz | cut -f1))"
+
+      - name: Desplegar Backend Despachos
+        run: |
+          IP="${{ steps.ips.outputs.BD_PUBLIC }}"
+          DB_IP="${{ steps.ips.outputs.DBD_PRIVATE }}"
+          echo "Desplegando Backend Despachos en $IP (DB: $DB_IP)..."
+
+          scp ${{ env.SSH_OPTS }} -i key.pem \
+            /tmp/backend-despachos.tar.gz ec2-user@$IP:~/
+
+          ssh ${{ env.SSH_OPTS }} -i key.pem ec2-user@$IP << DEPLOY
+          set -e
+
+          mkdir -p ~/app
+          cd ~/app
+          rm -rf ./* ./.[!.]* 2>/dev/null || true
+          tar -xzf ~/backend-despachos.tar.gz
+
+          docker stop backend-despachos 2>/dev/null || true
+          docker rm backend-despachos 2>/dev/null || true
+
+          echo "Compilando la imagen de Docker (suele tomar unos 5 minutos)..."
+          docker build -t backend-despachos .
+
+          docker run -d \
+            --name backend-despachos \
+            --restart unless-stopped \
+            -p 8081:8081 \
+            -e DB_ENDPOINT=${DB_IP} \
+            -e DB_PORT=3306 \
+            -e DB_NAME=db_despachos \
+            -e DB_USERNAME=user_despachos \
+            -e DB_PASSWORD=pass_despachos \
+            -e SERVER_PORT=8081 \
+            backend-despachos
+
+          echo "Backend Despachos corriendo"
+          DEPLOY
+
+
+
+
+      - name: Preparar Frontend
+        run: |
+          BV_IP="${{ steps.ips.outputs.BV_PRIVATE }}"
+          BD_IP="${{ steps.ips.outputs.BD_PRIVATE }}"
+
+          echo "Configurando nginx.conf con las IPs de backend ($BV_IP y $BD_IP)..."
+
+          # Generar nginx.conf con las IPs reales de los backends
+          sed "s/BACKEND_VENTAS_IP/$BV_IP/g; s/BACKEND_DESPACHOS_IP/$BD_IP/g" \
+            front_despacho/nginx-aws.conf.template > front_despacho/nginx.conf
+
+          echo "nginx.conf configurado:"
+          cat front_despacho/nginx.conf
+
+          # Empaquetar frontend (con el nginx.conf actualizado)
+          tar -czf /tmp/frontend.tar.gz -C front_despacho .
+          echo "Frontend comprimido ($(du -h /tmp/frontend.tar.gz | cut -f1))"
+
+      - name: Desplegar Frontend
+        run: |
+          IP="${{ steps.ips.outputs.FRONTEND_PUBLIC }}"
+          echo "Desplegando Frontend en $IP..."
+
+          scp ${{ env.SSH_OPTS }} -i key.pem \
+            /tmp/frontend.tar.gz ec2-user@$IP:~/
+
+          ssh ${{ env.SSH_OPTS }} -i key.pem ec2-user@$IP << 'DEPLOY'
+          set -e
+
+          mkdir -p ~/app
+          cd ~/app
+          rm -rf ./* ./.[!.]* 2>/dev/null || true
+          tar -xzf ~/frontend.tar.gz
+
+          docker stop frontend 2>/dev/null || true
+          docker rm frontend 2>/dev/null || true
+
+          echo "Compilando la imagen del Frontend (suele tomar unos 3 minutos)..."
+          docker build -t frontend .
+
+          docker run -d \
+            --name frontend \
+            --restart unless-stopped \
+            -p 80:80 \
+            frontend
+
+          echo "Frontend corriendo"
+          DEPLOY
+
+
+
+      - name: Health Check
+        run: |
+          FRONTEND_IP="${{ steps.ips.outputs.FRONTEND_PUBLIC }}"
+          BV_IP="${{ steps.ips.outputs.BV_PUBLIC }}"
+          BD_IP="${{ steps.ips.outputs.BD_PUBLIC }}"
+
+          echo "Comprobando que los servicios respondan..."
+          echo ""
+
+          # Esperar un momento para que los servicios arranquen
+          sleep 30
+
+          # Verificar Backend Ventas
+          echo "Backend Ventas (http://$BV_IP:8080)..."
+          if curl -s --max-time 10 "http://$BV_IP:8080" > /dev/null 2>&1; then
+            echo "  Backend Ventas OK"
+          else
+            echo "  Backend Ventas no responde (espera un momento)"
+          fi
+
+          # Verificar Backend Despachos
+          echo "Backend Despachos (http://$BD_IP:8081)..."
+          if curl -s --max-time 10 "http://$BD_IP:8081" > /dev/null 2>&1; then
+            echo "  Backend Despachos OK"
+          else
+            echo "  Backend Despachos no responde (espera un momento)"
+          fi
+
+          # Verificar Frontend
+          echo "Frontend (http://$FRONTEND_IP)..."
+          if curl -s --max-time 10 "http://$FRONTEND_IP" > /dev/null 2>&1; then
+            echo "  Frontend OK"
+          else
+            echo "  Frontend no responde (espera un momento)"
+          fi
+
+          echo ""
+          echo "--------------------------------------------"
+          echo "Despliegue finalizado"
+          echo "Acceso a la app: http://$FRONTEND_IP"
+          echo "Si algún servicio no responde de inmediato, dale un par de minutos."
+          echo "--------------------------------------------"

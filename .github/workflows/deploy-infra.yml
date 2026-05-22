@@ -1,0 +1,139 @@
+# Levanta la red, grupos de seguridad e instancias en AWS con CloudFormation.
+# Genera y guarda la clave SSH en SSM para los despliegues de la aplicación.
+
+
+name: 'Deploy Infrastructure'
+
+
+on:
+  workflow_dispatch:
+    inputs:
+      instance_type:
+        description: 'Tipo de instancia EC2 (t2.micro = 1GB, t2.small = 2GB)'
+        required: false
+        default: 't2.micro'
+        type: choice
+        options:
+          - t2.micro
+          - t2.small
+
+
+env:
+  AWS_REGION: us-east-1
+  STACK_NAME: devops-baeza-laspina
+  KEY_PAIR_NAME: devops-deploy-key
+  SSM_KEY_PARAM: /devops/deploy-key
+
+
+jobs:
+  deploy-infrastructure:
+    name: 'Crear Infraestructura AWS'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout codigo
+        uses: actions/checkout@v4
+
+      # Credenciales de AWS (Academy usa tokens temporales)
+      - name: Configurar credenciales AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verificar conexion AWS
+        run: |
+          echo "Verificando identidad AWS..."
+          aws sts get-caller-identity
+          echo ""
+          echo "Region: ${{ env.AWS_REGION }}"
+
+      # Crea la clave SSH y la sube a SSM para los despliegues
+      - name: Crear Key Pair SSH
+        run: |
+          echo "Configurando Key Pair '${{ env.KEY_PAIR_NAME }}'..."
+
+          aws ec2 delete-key-pair \
+            --key-name ${{ env.KEY_PAIR_NAME }} 2>/dev/null || true
+
+          aws ec2 create-key-pair \
+            --key-name ${{ env.KEY_PAIR_NAME }} \
+            --query 'KeyMaterial' \
+            --output text > /tmp/key.pem
+
+          # Usamos String normal porque AWS Academy no permite SecureString (KMS)
+          aws ssm put-parameter \
+            --name ${{ env.SSM_KEY_PARAM }} \
+            --type String \
+            --value "$(cat /tmp/key.pem)" \
+            --overwrite
+
+          rm -f /tmp/key.pem
+
+          echo "Key Pair creado y almacenado en SSM Parameter Store"
+
+      - name: Validar template CloudFormation
+        run: |
+          echo "Validando template..."
+          aws cloudformation validate-template \
+            --template-body file://infra/cloudformation.yml
+          echo "Template valido"
+
+      # Crea o actualiza el stack de recursos en AWS
+      - name: Desplegar stack CloudFormation
+        run: |
+          echo "Desplegando infraestructura..."
+          echo "   Stack: ${{ env.STACK_NAME }}"
+          echo "   Instancias: ${{ github.event.inputs.instance_type || 't2.micro' }}"
+          echo ""
+
+          aws cloudformation deploy \
+            --template-file infra/cloudformation.yml \
+            --stack-name ${{ env.STACK_NAME }} \
+            --parameter-overrides \
+              KeyPairName=${{ env.KEY_PAIR_NAME }} \
+              InstanceType=${{ github.event.inputs.instance_type || 't2.micro' }} \
+            --no-fail-on-empty-changeset \
+            --tags \
+              Project=devops-baeza-laspina \
+              Environment=sandbox
+
+          echo ""
+          echo "Infraestructura desplegada exitosamente"
+
+      - name: Mostrar IPs de las instancias
+        run: |
+          echo "============================================"
+          echo "  INFRAESTRUCTURA CREADA"
+          echo "============================================"
+          echo ""
+
+          get_output() {
+            aws cloudformation describe-stacks \
+              --stack-name ${{ env.STACK_NAME }} \
+              --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" \
+              --output text
+          }
+
+          FRONTEND_IP=$(get_output FrontendPublicIP)
+          BV_PUBLIC=$(get_output BackendVentasPublicIP)
+          BV_PRIVATE=$(get_output BackendVentasPrivateIP)
+          BD_PUBLIC=$(get_output BackendDespachosPublicIP)
+          BD_PRIVATE=$(get_output BackendDespachosPrivateIP)
+          DBV_PUBLIC=$(get_output MySQLVentasPublicIP)
+          DBV_PRIVATE=$(get_output MySQLVentasPrivateIP)
+          DBD_PUBLIC=$(get_output MySQLDespachosPublicIP)
+          DBD_PRIVATE=$(get_output MySQLDespachosPrivateIP)
+
+          echo "Frontend:           $FRONTEND_IP (publico)"
+          echo "Backend Ventas:     $BV_PUBLIC (publico) / $BV_PRIVATE (privado)"
+          echo "Backend Despachos:  $BD_PUBLIC (publico) / $BD_PRIVATE (privado)"
+          echo "MySQL Ventas:       $DBV_PUBLIC (publico) / $DBV_PRIVATE (privado)"
+          echo "MySQL Despachos:    $DBD_PUBLIC (publico) / $DBD_PRIVATE (privado)"
+          echo ""
+          echo "URL de la aplicación: http://$FRONTEND_IP"
+          echo ""
+          echo "Siguiente paso: ejecuta el workflow 'Deploy Application'"
+          echo "============================================"

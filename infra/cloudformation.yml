@@ -1,0 +1,439 @@
+
+#   RED:
+#     - VPC (10.0.0.0/16)
+#     - Subnet Pública (10.0.1.0/24) con auto-assign IP pública
+#     - Internet Gateway + Route Table
+#
+#   SEGURIDAD (Security Groups):
+#     - SG Frontend: permite HTTP (80) y SSH (22)
+#     - SG Backend Ventas: permite 8080 desde VPC + SSH
+#     - SG Backend Despachos: permite 8081 desde VPC + SSH
+#     - SG DB Ventas: permite 3306 SOLO desde Backend Ventas + SSH
+#     - SG DB Despachos: permite 3306 SOLO desde Backend Despachos + SSH
+#
+#   INSTANCIAS EC2 (5x t2.micro con Amazon Linux 2023):
+#     - ec2-frontend: Nginx + React
+#     - ec2-backend-ventas: Spring Boot :8080
+#     - ec2-backend-despachos: Spring Boot :8081
+#     - ec2-mysql-ventas: MySQL 8.0 :3306
+#     - ec2-mysql-despachos: MySQL 8.0 :3306
+#
+
+
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Infraestructura AWS para proyecto DevOps Baeza/La Spina.
+  Crea VPC, Security Groups y 5 instancias EC2 para desplegar
+  la aplicacion con Docker (frontend, 2 backends, 2 databases).
+
+
+
+Parameters:
+
+  KeyPairName:
+    Type: String
+    Default: devops-deploy-key
+    Description: >
+      Nombre del Key Pair SSH para acceder a las instancias EC2.
+      Debe existir en la cuenta AWS antes de crear el stack.
+
+  InstanceType:
+    Type: String
+    Default: t2.micro
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t3.micro
+      - t3.small
+    Description: >
+      Tipo de instancia EC2. t2.micro es gratuito en Free Tier.
+      t2.small (2GB RAM) es recomendado si los builds fallan por memoria.
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: >
+      AMI ID de Amazon Linux 2023. Se resuelve automaticamente
+      a la ultima version disponible en la region.
+
+
+Resources:
+
+  # Crea una red aislada en AWS donde vivirán todas las
+  # instancias. El CIDR 10.0.0.0/16 permite hasta 65,536 IPs.
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: devops-vpc
+        - Key: Project
+          Value: devops-baeza-laspina
+
+
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: devops-igw
+
+  # Adjunta el Internet Gateway a la VPC
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+
+
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: devops-public-subnet
+
+
+
+  #ROUTE TABLE — Tabla de rutas para la subnet pública
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: devops-public-rt
+
+  # Ruta por defecto: todo el tráfico sale por el Internet Gateway
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  # Asocia la subnet con la route table
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+
+
+  SGFrontend:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group para Frontend - Nginx + React
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP desde internet
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: SSH para deployment
+      Tags:
+        - Key: Name
+          Value: devops-sg-frontend
+
+  SGBackendVentas:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group para Backend Ventas - Spring Boot
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 10.0.0.0/16
+          Description: API desde la VPC
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: SSH para deployment
+      Tags:
+        - Key: Name
+          Value: devops-sg-backend-ventas
+
+  SGBackendDespachos:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group para Backend Despachos - Spring Boot
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8081
+          ToPort: 8081
+          CidrIp: 10.0.0.0/16
+          Description: API desde la VPC
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: SSH para deployment
+      Tags:
+        - Key: Name
+          Value: devops-sg-backend-despachos
+
+
+  SGDatabaseVentas:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group para MySQL Ventas
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref SGBackendVentas
+          Description: MySQL solo desde Backend Ventas
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: SSH para deployment
+      Tags:
+        - Key: Name
+          Value: devops-sg-db-ventas
+
+
+  SGDatabaseDespachos:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group para MySQL Despachos
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref SGBackendDespachos
+          Description: MySQL solo desde Backend Despachos
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: SSH para deployment
+      Tags:
+        - Key: Name
+          Value: devops-sg-db-despachos
+
+
+
+  EC2MySQLVentas:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref LatestAmiId
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref SGDatabaseVentas
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          # ---- Instalacion de Docker en Amazon Linux 2023 ----
+          dnf update -y
+          dnf install -y docker
+          systemctl enable docker
+          systemctl start docker
+          usermod -aG docker ec2-user
+          # Marcador de que el setup termino
+          touch /home/ec2-user/.setup-complete
+      Tags:
+        - Key: Name
+          Value: devops-mysql-ventas
+        - Key: Service
+          Value: mysql-ventas
+
+
+  EC2MySQLDespachos:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref LatestAmiId
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref SGDatabaseDespachos
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          dnf update -y
+          dnf install -y docker
+          systemctl enable docker
+          systemctl start docker
+          usermod -aG docker ec2-user
+          touch /home/ec2-user/.setup-complete
+      Tags:
+        - Key: Name
+          Value: devops-mysql-despachos
+        - Key: Service
+          Value: mysql-despachos
+
+
+  # Incluye swap de 2GB para que Maven pueda compilar
+  # en una instancia t2.micro (1GB RAM).
+  EC2BackendVentas:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref LatestAmiId
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref SGBackendVentas
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          dnf update -y
+          dnf install -y docker git
+          systemctl enable docker
+          systemctl start docker
+          usermod -aG docker ec2-user
+          # Swap de 2GB para que Maven pueda compilar
+          dd if=/dev/zero of=/swapfile bs=128M count=16
+          chmod 600 /swapfile
+          mkswap /swapfile
+          swapon /swapfile
+          echo '/swapfile swap swap defaults 0 0' >> /etc/fstab
+          touch /home/ec2-user/.setup-complete
+      Tags:
+        - Key: Name
+          Value: devops-backend-ventas
+        - Key: Service
+          Value: backend-ventas
+
+
+  EC2BackendDespachos:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref LatestAmiId
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref SGBackendDespachos
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          dnf update -y
+          dnf install -y docker git
+          systemctl enable docker
+          systemctl start docker
+          usermod -aG docker ec2-user
+          # Swap de 2GB para que Maven pueda compilar
+          dd if=/dev/zero of=/swapfile bs=128M count=16
+          chmod 600 /swapfile
+          mkswap /swapfile
+          swapon /swapfile
+          echo '/swapfile swap swap defaults 0 0' >> /etc/fstab
+          touch /home/ec2-user/.setup-complete
+      Tags:
+        - Key: Name
+          Value: devops-backend-despachos
+        - Key: Service
+          Value: backend-despachos
+
+
+  EC2Frontend:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref LatestAmiId
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref SGFrontend
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          dnf update -y
+          dnf install -y docker git
+          systemctl enable docker
+          systemctl start docker
+          usermod -aG docker ec2-user
+          # Swap de 2GB para que npm pueda compilar
+          dd if=/dev/zero of=/swapfile bs=128M count=16
+          chmod 600 /swapfile
+          mkswap /swapfile
+          swapon /swapfile
+          echo '/swapfile swap swap defaults 0 0' >> /etc/fstab
+          touch /home/ec2-user/.setup-complete
+      Tags:
+        - Key: Name
+          Value: devops-frontend
+        - Key: Service
+          Value: frontend
+
+
+
+# Estos valores se consultan después del despliegue para
+# obtener las IPs de las instancias y configurar los servicios.
+Outputs:
+
+  VpcId:
+    Value: !Ref VPC
+    Description: ID de la VPC creada
+
+  FrontendPublicIP:
+    Value: !GetAtt EC2Frontend.PublicIp
+    Description: IP publica del Frontend (acceder en el navegador)
+
+  FrontendPrivateIP:
+    Value: !GetAtt EC2Frontend.PrivateIp
+    Description: IP privada del Frontend
+
+  BackendVentasPublicIP:
+    Value: !GetAtt EC2BackendVentas.PublicIp
+    Description: IP publica del Backend Ventas
+
+  BackendVentasPrivateIP:
+    Value: !GetAtt EC2BackendVentas.PrivateIp
+    Description: IP privada del Backend Ventas
+
+  BackendDespachosPublicIP:
+    Value: !GetAtt EC2BackendDespachos.PublicIp
+    Description: IP publica del Backend Despachos
+
+  BackendDespachosPrivateIP:
+    Value: !GetAtt EC2BackendDespachos.PrivateIp
+    Description: IP privada del Backend Despachos
+
+  MySQLVentasPublicIP:
+    Value: !GetAtt EC2MySQLVentas.PublicIp
+    Description: IP publica de MySQL Ventas (solo para SSH)
+
+  MySQLVentasPrivateIP:
+    Value: !GetAtt EC2MySQLVentas.PrivateIp
+    Description: IP privada de MySQL Ventas (usada por el backend)
+
+  MySQLDespachosPublicIP:
+    Value: !GetAtt EC2MySQLDespachos.PublicIp
+    Description: IP publica de MySQL Despachos (solo para SSH)
+
+  MySQLDespachosPrivateIP:
+    Value: !GetAtt EC2MySQLDespachos.PrivateIp
+    Description: IP privada de MySQL Despachos (usada por el backend)
+
+  ApplicationURL:
+    Value: !Sub 'http://${EC2Frontend.PublicIp}'
+    Description: URL de la aplicacion (abrir en el navegador)
