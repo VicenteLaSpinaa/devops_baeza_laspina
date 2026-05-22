@@ -1,0 +1,254 @@
+# ============================================================
+# docker-compose.yml — Orquestación del Stack Completo
+# ============================================================
+# Este archivo define y conecta los 5 servicios del proyecto:
+#   1. frontend        → Nginx sirviendo React (puerto 80)
+#   2. backend-ventas  → Spring Boot API REST (puerto 8080)
+#   3. backend-despachos → Spring Boot API REST (puerto 8081)
+#   4. mysql-ventas    → Base de datos MySQL para Ventas
+#   5. mysql-despachos → Base de datos MySQL para Despachos
+#
+# Arquitectura de red:
+#   - Red "front-back": conecta frontend con ambos backends.
+#   - Red "back-db": conecta backends con sus bases de datos.
+#     Las bases de datos NO exponen puertos al host.
+#
+# Los backends están en AMBAS redes porque actúan como puente:
+#   frontend → (front-back) → backends → (back-db) → databases
+# ============================================================
+
+
+# Versión del formato de docker-compose
+version: "3.8"
+
+
+# ============================================================
+# SERVICIOS — Cada servicio es un contenedor independiente
+# ============================================================
+services:
+
+  # ----------------------------------------------------------
+  # MYSQL VENTAS — Base de datos para el microservicio Ventas
+  # ----------------------------------------------------------
+  # Se define primero porque los backends dependen de ella.
+  # NO expone puertos al host (solo accesible desde la red back-db).
+  mysql-ventas:
+    # Imagen oficial de MySQL 8.0 desde Docker Hub
+    image: mysql:8.0
+
+    # Nombre fijo del contenedor para identificarlo fácilmente
+    container_name: mysql-ventas
+
+    # Reinicia el contenedor automáticamente si se cae,
+    # excepto si tú lo detienes manualmente con docker stop.
+    restart: unless-stopped
+
+    # Variables de entorno que MySQL lee al iniciar por primera vez
+    # para crear la base de datos, el usuario y su contraseña.
+    environment:
+      # Contraseña del usuario root de MySQL
+      MYSQL_ROOT_PASSWORD: root_password_ventas
+      # Nombre de la base de datos que MySQL crea automáticamente
+      MYSQL_DATABASE: db_ventas
+      # Usuario no-root que la aplicación Spring Boot usará
+      MYSQL_USER: user_ventas
+      # Contraseña del usuario no-root
+      MYSQL_PASSWORD: pass_ventas
+
+    # Volumen nombrado para persistencia de datos.
+    # /var/lib/mysql es donde MySQL guarda los archivos de las
+    # tablas, índices y datos. Sin este volumen, al destruir
+    # el contenedor se pierden todos los datos.
+    volumes:
+      - mysql-ventas-data:/var/lib/mysql
+
+    # Solo pertenece a la red back-db (no accesible desde el frontend)
+    networks:
+      - back-db
+
+    # Healthcheck: verifica que MySQL está listo para recibir
+    # conexiones. Los backends esperarán a que este check pase.
+    # mysqladmin ping envía un "ping" al servidor MySQL y
+    # retorna exit code 0 si responde, 1 si no.
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-proot_password_ventas"]
+      # Espera 30 segundos antes del primer check (MySQL tarda en iniciar)
+      interval: 10s
+      # Si el ping tarda más de 5 segundos, lo considera fallido
+      timeout: 5s
+      # Después de 5 fallos consecutivos, marca el servicio como unhealthy
+      retries: 5
+      # Periodo de gracia inicial antes de empezar los healthchecks
+      start_period: 30s
+
+
+  # ----------------------------------------------------------
+  # MYSQL DESPACHOS — Base de datos para el microservicio Despachos
+  # ----------------------------------------------------------
+  mysql-despachos:
+    image: mysql:8.0
+    container_name: mysql-despachos
+    restart: unless-stopped
+
+    environment:
+      MYSQL_ROOT_PASSWORD: root_password_despachos
+      MYSQL_DATABASE: db_despachos
+      MYSQL_USER: user_despachos
+      MYSQL_PASSWORD: pass_despachos
+
+    # Volumen separado para la base de datos de Despachos
+    volumes:
+      - mysql-despachos-data:/var/lib/mysql
+
+    networks:
+      - back-db
+
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-proot_password_despachos"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+
+  # ----------------------------------------------------------
+  # BACKEND VENTAS — API REST Spring Boot (puerto 8080)
+  # ----------------------------------------------------------
+  backend-ventas:
+    # Construye la imagen usando el Dockerfile ubicado en esta ruta.
+    # Docker ejecuta las 2 etapas del multi-stage build.
+    build:
+      context: ./back-Ventas_SpringBoot/Springboot-API-REST
+      dockerfile: Dockerfile
+
+    container_name: backend-ventas
+    restart: unless-stopped
+
+    # Mapeo de puertos → host:contenedor
+    # El puerto 8080 de tu máquina apunta al 8080 del contenedor
+    ports:
+      - "8080:8080"
+
+    # Variables de entorno que Spring Boot lee en application.properties
+    # mediante la sintaxis ${VARIABLE_NAME}.
+    # Estos valores se inyectan al contenedor en tiempo de ejecución.
+    environment:
+      # Hostname del contenedor MySQL dentro de la red Docker.
+      # Docker resuelve "mysql-ventas" a la IP interna del contenedor.
+      DB_ENDPOINT: mysql-ventas
+      # Puerto interno de MySQL (3306 es el puerto estándar)
+      DB_PORT: 3306
+      # Nombre de la base de datos (debe coincidir con MYSQL_DATABASE arriba)
+      DB_NAME: db_ventas
+      # Credenciales (deben coincidir con MYSQL_USER y MYSQL_PASSWORD arriba)
+      DB_USERNAME: user_ventas
+      DB_PASSWORD: pass_ventas
+      # Puerto en el que Spring Boot escuchará
+      SERVER_PORT: 8080
+
+    # Este backend pertenece a 2 redes:
+    #   - front-back: para que Nginx pueda enviarle peticiones
+    #   - back-db: para que pueda conectarse a MySQL
+    networks:
+      - front-back
+      - back-db
+
+    # depends_on con condition: service_healthy hace que Docker
+    # NO inicie este contenedor hasta que mysql-ventas pase su
+    # healthcheck. Sin esto, Spring Boot intentaría conectarse
+    # a MySQL antes de que esté listo y fallaría.
+    depends_on:
+      mysql-ventas:
+        condition: service_healthy
+
+
+  # ----------------------------------------------------------
+  # BACKEND DESPACHOS — API REST Spring Boot (puerto 8081)
+  # ----------------------------------------------------------
+  backend-despachos:
+    build:
+      context: ./back-Despachos_SpringBoot/Springboot-API-REST-DESPACHO
+      dockerfile: Dockerfile
+
+    container_name: backend-despachos
+    restart: unless-stopped
+
+    ports:
+      - "8081:8081"
+
+    environment:
+      DB_ENDPOINT: mysql-despachos
+      DB_PORT: 3306
+      DB_NAME: db_despachos
+      DB_USERNAME: user_despachos
+      DB_PASSWORD: pass_despachos
+      SERVER_PORT: 8081
+
+    networks:
+      - front-back
+      - back-db
+
+    depends_on:
+      mysql-despachos:
+        condition: service_healthy
+
+
+  # ----------------------------------------------------------
+  # FRONTEND — Nginx sirviendo React + Reverse Proxy (puerto 80)
+  # ----------------------------------------------------------
+  frontend:
+    build:
+      context: ./front_despacho
+      dockerfile: Dockerfile
+
+    container_name: frontend
+    restart: unless-stopped
+
+    # Puerto 80 del host → puerto 80 del contenedor Nginx
+    ports:
+      - "80:80"
+
+    # Solo necesita la red front-back para comunicarse con los backends.
+    # NO necesita acceso a las bases de datos.
+    networks:
+      - front-back
+
+    # Espera a que ambos backends estén levantados antes de iniciar.
+    # Esto evita que Nginx intente hacer proxy_pass a backends
+    # que aún no existen, lo que causaría errores 502 Bad Gateway.
+    depends_on:
+      - backend-ventas
+      - backend-despachos
+
+
+# ============================================================
+# REDES — Aislamiento de tráfico entre capas
+# ============================================================
+# Docker crea redes virtuales internas. Los contenedores solo
+# pueden comunicarse si pertenecen a la MISMA red.
+networks:
+  # Red pública/intermedia: frontend ↔ backends
+  # El frontend (Nginx) envía peticiones HTTP a los backends.
+  front-back:
+    driver: bridge
+
+  # Red privada interna: backends ↔ bases de datos
+  # Las bases de datos SOLO son accesibles desde esta red.
+  # Ni el frontend ni máquinas externas pueden conectarse a ellas.
+  back-db:
+    driver: bridge
+    internal: true
+
+
+# ============================================================
+# VOLÚMENES — Persistencia de datos de las bases de datos
+# ============================================================
+# Los volúmenes nombrados (named volumes) almacenan los datos
+# de MySQL en el sistema de archivos del HOST, fuera del
+# contenedor. Esto significa que:
+#   - docker-compose down: los datos se mantienen
+#   - docker-compose down -v: los datos se eliminan (flag -v)
+#   - docker-compose up: si el volumen ya existe, MySQL lo reutiliza
+volumes:
+  mysql-ventas-data:
+  mysql-despachos-data:

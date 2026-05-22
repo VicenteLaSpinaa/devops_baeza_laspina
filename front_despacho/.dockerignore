@@ -1,0 +1,38 @@
+# ============================================================
+# .dockerignore — Frontend React (Vite)
+# Excluye archivos innecesarios del contexto de build de Docker
+# para reducir el tamaño de la imagen y acelerar la construcción.
+# ============================================================
+
+# Dependencias locales de Node.js (se reinstalan dentro del contenedor)
+node_modules
+
+# Carpeta de build local (se regenera dentro del contenedor)
+dist
+
+# Control de versiones
+.git
+.gitignore
+
+# Archivos de configuración del IDE
+.vscode
+.idea
+*.iml
+
+# Variables de entorno locales (no se envían al build)
+.env
+.env.local
+.env.*.local
+
+# Archivos temporales y logs
+*.log
+npm-debug.log*
+*.swp
+*~
+
+# El propio Dockerfile no se necesita dentro de la imagen
+Dockerfile
+docker-compose*.yml
+
+# Archivos de documentación
+README.md
