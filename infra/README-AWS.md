@@ -18,6 +18,7 @@ Guía completa para desplegar la aplicación automáticamente en AWS usando CI/C
 
 ## Arquitectura
 
+<img width="2816" height="1536" alt="diagrama" src="https://github.com/user-attachments/assets/e5211b5c-231d-406a-adbf-2f008a1198f3" />
 
 
 **Componentes AWS creados:**
