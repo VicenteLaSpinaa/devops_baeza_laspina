@@ -1,0 +1,133 @@
+# Pipeline CI/CD para AWS ECS Fargate
+
+name: Deploy to AWS ECS
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+  ECS_CLUSTER: ${{ secrets.ECS_CLUSTER }}
+
+jobs:
+  deploy:
+    name: Build, Push & Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar credenciales AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login en Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build imagen Docker del Frontend
+        run: |
+          docker build \
+            -t ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ secrets.ECR_FRONTEND_REPOSITORY }}:latest \
+            -t ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ secrets.ECR_FRONTEND_REPOSITORY }}:${{ github.sha }} \
+            ./front_despacho
+
+      - name: Push imagen Frontend a ECR
+        run: |
+          docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ secrets.ECR_FRONTEND_REPOSITORY }}:latest
+          docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ secrets.ECR_FRONTEND_REPOSITORY }}:${{ github.sha }}
+
+      - name: Build imagen Docker del Backend Ventas
+        run: |
+          docker build \
+            -t ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ secrets.ECR_BACKEND_VENTAS_REPOSITORY }}:latest \
+            -t ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ secrets.ECR_BACKEND_VENTAS_REPOSITORY }}:${{ github.sha }} \
+            ./back-Ventas_SpringBoot/Springboot-API-REST
+
+      - name: Push imagen Backend Ventas a ECR
+        run: |
+          docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ secrets.ECR_BACKEND_VENTAS_REPOSITORY }}:latest
+          docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ secrets.ECR_BACKEND_VENTAS_REPOSITORY }}:${{ github.sha }}
+
+      - name: Build imagen Docker del Backend Despachos
+        run: |
+          docker build \
+            -t ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ secrets.ECR_BACKEND_DESPACHOS_REPOSITORY }}:latest \
+            -t ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ secrets.ECR_BACKEND_DESPACHOS_REPOSITORY }}:${{ github.sha }} \
+            ./back-Despachos_SpringBoot/Springboot-API-REST-DESPACHO
+
+      - name: Push imagen Backend Despachos a ECR
+        run: |
+          docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ secrets.ECR_BACKEND_DESPACHOS_REPOSITORY }}:latest
+          docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ secrets.ECR_BACKEND_DESPACHOS_REPOSITORY }}:${{ github.sha }}
+
+      - name: Deploy Frontend en ECS
+        run: |
+          aws ecs update-service \
+            --cluster ${{ secrets.ECS_CLUSTER }} \
+            --service ${{ secrets.ECS_FRONTEND_SERVICE }} \
+            --force-new-deployment \
+            --region ${{ secrets.AWS_REGION }}
+
+      - name: Deploy Backend Ventas en ECS
+        run: |
+          aws ecs update-service \
+            --cluster ${{ secrets.ECS_CLUSTER }} \
+            --service ${{ secrets.ECS_BACKEND_VENTAS_SERVICE }} \
+            --force-new-deployment \
+            --region ${{ secrets.AWS_REGION }}
+
+      - name: Deploy Backend Despachos en ECS
+        run: |
+          aws ecs update-service \
+            --cluster ${{ secrets.ECS_CLUSTER }} \
+            --service ${{ secrets.ECS_BACKEND_DESPACHOS_SERVICE }} \
+            --force-new-deployment \
+            --region ${{ secrets.AWS_REGION }}
+
+      - name: Esperar estabilidad del Frontend
+        run: |
+          aws ecs wait services-stable \
+            --cluster ${{ secrets.ECS_CLUSTER }} \
+            --services ${{ secrets.ECS_FRONTEND_SERVICE }} \
+            --region ${{ secrets.AWS_REGION }}
+          echo "Frontend estable"
+
+      - name: Esperar estabilidad del Backend Ventas
+        run: |
+          aws ecs wait services-stable \
+            --cluster ${{ secrets.ECS_CLUSTER }} \
+            --services ${{ secrets.ECS_BACKEND_VENTAS_SERVICE }} \
+            --region ${{ secrets.AWS_REGION }}
+          echo "Backend Ventas estable"
+
+      - name: Esperar estabilidad del Backend Despachos
+        run: |
+          aws ecs wait services-stable \
+            --cluster ${{ secrets.ECS_CLUSTER }} \
+            --services ${{ secrets.ECS_BACKEND_DESPACHOS_SERVICE }} \
+            --region ${{ secrets.AWS_REGION }}
+          echo "Backend Despachos estable"
+
+      - name: Resumen del despliegue
+        run: |
+          echo "========================================="
+          echo "  DESPLIEGUE EXITOSO"
+          echo "========================================="
+          echo "Commit: ${{ github.sha }}"
+          echo "Branch: ${{ github.ref_name }}"
+          echo "Cluster: ${{ secrets.ECS_CLUSTER }}"
+          echo "Region: ${{ secrets.AWS_REGION }}"
+          echo ""
+          echo "Servicios actualizados:"
+          echo "  ${{ secrets.ECS_FRONTEND_SERVICE }}"
+          echo "  ${{ secrets.ECS_BACKEND_VENTAS_SERVICE }}"
+          echo "  ${{ secrets.ECS_BACKEND_DESPACHOS_SERVICE }}"
+          echo "========================================="
