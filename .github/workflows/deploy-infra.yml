@@ -343,6 +343,10 @@ jobs:
       # ----------------------------------------------------------------
       - name: Crear Cluster ECS
         run: |
+          # Asegurar que existan los roles de servicio vinculados (Service-Linked Roles)
+          aws iam create-service-linked-role --aws-service-name ecs.amazonaws.com 2>/dev/null || true
+          aws iam create-service-linked-role --aws-service-name ecs.application-autoscaling.amazonaws.com 2>/dev/null || true
+
           ECS_CLUSTER_NAME="${{ env.PROJECT }}-cluster"
           CLUSTER_STATUS=$(aws ecs describe-clusters \
             --clusters $ECS_CLUSTER_NAME \
@@ -351,8 +355,6 @@ jobs:
           if [ "$CLUSTER_STATUS" != "ACTIVE" ]; then
             aws ecs create-cluster \
               --cluster-name $ECS_CLUSTER_NAME \
-              --capacity-providers FARGATE \
-              --default-capacity-provider-strategy capacityProvider=FARGATE,weight=1 \
               --tags key=Project,value=${{ env.PROJECT }}
             echo "Cluster ECS creado: $ECS_CLUSTER_NAME"
           else
@@ -416,25 +418,54 @@ jobs:
             \"family\": \"${{ env.PROJECT }}-backend-ventas\",
             \"networkMode\": \"awsvpc\",
             \"requiresCompatibilities\": [\"FARGATE\"],
-            \"cpu\": \"512\",
-            \"memory\": \"1024\",
+            \"cpu\": \"1024\",
+            \"memory\": \"2048\",
             \"executionRoleArn\": \"$LAB_ROLE\",
             \"taskRoleArn\": \"$LAB_ROLE\",
-            \"containerDefinitions\": [{
-              \"name\": \"${{ env.PROJECT }}-backend-ventas\",
-              \"image\": \"$ECR_BASE/${{ env.PROJECT }}-backend-ventas:latest\",
-              \"essential\": true,
-              \"portMappings\": [{\"containerPort\": 8080, \"protocol\": \"tcp\"}],
-              \"environment\": [{\"name\": \"SERVER_PORT\", \"value\": \"8080\"}],
-              \"logConfiguration\": {
-                \"logDriver\": \"awslogs\",
-                \"options\": {
-                  \"awslogs-group\": \"/ecs/${{ env.PROJECT }}/backend-ventas\",
-                  \"awslogs-region\": \"${{ env.AWS_REGION }}\",
-                  \"awslogs-stream-prefix\": \"ecs\"
+            \"containerDefinitions\": [
+              {
+                \"name\": \"${{ env.PROJECT }}-backend-ventas\",
+                \"image\": \"$ECR_BASE/${{ env.PROJECT }}-backend-ventas:latest\",
+                \"essential\": true,
+                \"portMappings\": [{\"containerPort\": 8080, \"protocol\": \"tcp\"}],
+                \"environment\": [
+                  {\"name\": \"SERVER_PORT\", \"value\": \"8080\"},
+                  {\"name\": \"DB_ENDPOINT\", \"value\": \"127.0.0.1\"},
+                  {\"name\": \"DB_PORT\", \"value\": \"3306\"},
+                  {\"name\": \"DB_NAME\", \"value\": \"db_ventas\"},
+                  {\"name\": \"DB_USERNAME\", \"value\": \"user_ventas\"},
+                  {\"name\": \"DB_PASSWORD\", \"value\": \"pass_ventas\"}
+                ],
+                \"logConfiguration\": {
+                  \"logDriver\": \"awslogs\",
+                  \"options\": {
+                    \"awslogs-group\": \"/ecs/${{ env.PROJECT }}/backend-ventas\",
+                    \"awslogs-region\": \"${{ env.AWS_REGION }}\",
+                    \"awslogs-stream-prefix\": \"ecs\"
+                  }
+                }
+              },
+              {
+                \"name\": \"mysql-ventas\",
+                \"image\": \"public.ecr.aws/docker/library/mysql:8.0\",
+                \"essential\": true,
+                \"portMappings\": [{\"containerPort\": 3306, \"protocol\": \"tcp\"}],
+                \"environment\": [
+                  {\"name\": \"MYSQL_ROOT_PASSWORD\", \"value\": \"root_password_ventas\"},
+                  {\"name\": \"MYSQL_DATABASE\", \"value\": \"db_ventas\"},
+                  {\"name\": \"MYSQL_USER\", \"value\": \"user_ventas\"},
+                  {\"name\": \"MYSQL_PASSWORD\", \"value\": \"pass_ventas\"}
+                ],
+                \"logConfiguration\": {
+                  \"logDriver\": \"awslogs\",
+                  \"options\": {
+                    \"awslogs-group\": \"/ecs/${{ env.PROJECT }}/backend-ventas\",
+                    \"awslogs-region\": \"${{ env.AWS_REGION }}\",
+                    \"awslogs-stream-prefix\": \"ecs\"
+                  }
                 }
               }
-            }]
+            ]
           }"
           echo "Task Definition Backend Ventas registrada"
 
@@ -443,25 +474,54 @@ jobs:
             \"family\": \"${{ env.PROJECT }}-backend-despachos\",
             \"networkMode\": \"awsvpc\",
             \"requiresCompatibilities\": [\"FARGATE\"],
-            \"cpu\": \"512\",
-            \"memory\": \"1024\",
+            \"cpu\": \"1024\",
+            \"memory\": \"2048\",
             \"executionRoleArn\": \"$LAB_ROLE\",
             \"taskRoleArn\": \"$LAB_ROLE\",
-            \"containerDefinitions\": [{
-              \"name\": \"${{ env.PROJECT }}-backend-despachos\",
-              \"image\": \"$ECR_BASE/${{ env.PROJECT }}-backend-despachos:latest\",
-              \"essential\": true,
-              \"portMappings\": [{\"containerPort\": 8081, \"protocol\": \"tcp\"}],
-              \"environment\": [{\"name\": \"SERVER_PORT\", \"value\": \"8081\"}],
-              \"logConfiguration\": {
-                \"logDriver\": \"awslogs\",
-                \"options\": {
-                  \"awslogs-group\": \"/ecs/${{ env.PROJECT }}/backend-despachos\",
-                  \"awslogs-region\": \"${{ env.AWS_REGION }}\",
-                  \"awslogs-stream-prefix\": \"ecs\"
+            \"containerDefinitions\": [
+              {
+                \"name\": \"${{ env.PROJECT }}-backend-despachos\",
+                \"image\": \"$ECR_BASE/${{ env.PROJECT }}-backend-despachos:latest\",
+                \"essential\": true,
+                \"portMappings\": [{\"containerPort\": 8081, \"protocol\": \"tcp\"}],
+                \"environment\": [
+                  {\"name\": \"SERVER_PORT\", \"value\": \"8081\"},
+                  {\"name\": \"DB_ENDPOINT\", \"value\": \"127.0.0.1\"},
+                  {\"name\": \"DB_PORT\", \"value\": \"3306\"},
+                  {\"name\": \"DB_NAME\", \"value\": \"db_despachos\"},
+                  {\"name\": \"DB_USERNAME\", \"value\": \"user_despachos\"},
+                  {\"name\": \"DB_PASSWORD\", \"value\": \"pass_despachos\"}
+                ],
+                \"logConfiguration\": {
+                  \"logDriver\": \"awslogs\",
+                  \"options\": {
+                    \"awslogs-group\": \"/ecs/${{ env.PROJECT }}/backend-despachos\",
+                    \"awslogs-region\": \"${{ env.AWS_REGION }}\",
+                    \"awslogs-stream-prefix\": \"ecs\"
+                  }
+                }
+              },
+              {
+                \"name\": \"mysql-despachos\",
+                \"image\": \"public.ecr.aws/docker/library/mysql:8.0\",
+                \"essential\": true,
+                \"portMappings\": [{\"containerPort\": 3306, \"protocol\": \"tcp\"}],
+                \"environment\": [
+                  {\"name\": \"MYSQL_ROOT_PASSWORD\", \"value\": \"root_password_despachos\"},
+                  {\"name\": \"MYSQL_DATABASE\", \"value\": \"db_despachos\"},
+                  {\"name\": \"MYSQL_USER\", \"value\": \"user_despachos\"},
+                  {\"name\": \"MYSQL_PASSWORD\", \"value\": \"pass_despachos\"}
+                ],
+                \"logConfiguration\": {
+                  \"logDriver\": \"awslogs\",
+                  \"options\": {
+                    \"awslogs-group\": \"/ecs/${{ env.PROJECT }}/backend-despachos\",
+                    \"awslogs-region\": \"${{ env.AWS_REGION }}\",
+                    \"awslogs-stream-prefix\": \"ecs\"
+                  }
                 }
               }
-            }]
+            ]
           }"
           echo "Task Definition Backend Despachos registrada"
 
