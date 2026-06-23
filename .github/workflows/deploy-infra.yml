@@ -310,33 +310,44 @@ jobs:
             --load-balancer-arn $ALB_ARN \
             --query 'Listeners[?Port==`80`].ListenerArn' --output text)
 
-          if [ -z "$LISTENER_ARN" ]; then
+          if [ -z "$LISTENER_ARN" ] || [ "$LISTENER_ARN" = "None" ]; then
             LISTENER_ARN=$(aws elbv2 create-listener \
               --load-balancer-arn $ALB_ARN \
               --protocol HTTP --port 80 \
               --default-actions Type=forward,TargetGroupArn=$TG_FRONTEND_ARN \
               --query 'Listeners[0].ListenerArn' --output text)
-
-            aws elbv2 create-rule \
-              --listener-arn $LISTENER_ARN --priority 5 \
-              --conditions '[{"Field":"path-pattern","Values":["/api/health"]}]' \
-              --actions Type=forward,TargetGroupArn=$TG_VENTAS_ARN
-
-            aws elbv2 create-rule \
-              --listener-arn $LISTENER_ARN --priority 10 \
-              --conditions '[{"Field":"path-pattern","Values":["/api/v1/ventas*"]}]' \
-              --actions Type=forward,TargetGroupArn=$TG_VENTAS_ARN
-
-            aws elbv2 create-rule \
-              --listener-arn $LISTENER_ARN --priority 20 \
-              --conditions '[{"Field":"path-pattern","Values":["/api/v1/despachos*"]}]' \
-              --actions Type=forward,TargetGroupArn=$TG_DESPACHOS_ARN
-
-            echo "Listener y reglas creadas"
-          else
-            echo "Listener ya existe: $LISTENER_ARN"
+            echo "Listener creado"
           fi
           echo "LISTENER_ARN=$LISTENER_ARN" >> $GITHUB_ENV
+
+          # Eliminar reglas existentes si las hay para evitar conflictos de prioridad
+          for PRIO in 5 10 20; do
+            RULE_ARN=$(aws elbv2 describe-rules --listener-arn $LISTENER_ARN --query "Rules[?Priority=='$PRIO'].RuleArn" --output text 2>/dev/null || echo "None")
+            if [ ! -z "$RULE_ARN" ] && [ "$RULE_ARN" != "None" ]; then
+              aws elbv2 delete-rule --rule-arn $RULE_ARN
+              echo "Regla antigua con prioridad $PRIO eliminada"
+            fi
+          done
+
+          # Crear / Actualizar regla 5 (/api/health -> Ventas)
+          aws elbv2 create-rule \
+            --listener-arn $LISTENER_ARN --priority 5 \
+            --conditions '[{"Field":"path-pattern","Values":["/api/health"]}]' \
+            --actions Type=forward,TargetGroupArn=$TG_VENTAS_ARN
+
+          # Crear / Actualizar regla 10 (/api/ventas* y /api/v1/ventas* -> Ventas)
+          aws elbv2 create-rule \
+            --listener-arn $LISTENER_ARN --priority 10 \
+            --conditions '[{"Field":"path-pattern","Values":["/api/ventas*", "/api/v1/ventas*"]}]' \
+            --actions Type=forward,TargetGroupArn=$TG_VENTAS_ARN
+
+          # Crear / Actualizar regla 20 (/api/despachos* y /api/v1/despachos* -> Despachos)
+          aws elbv2 create-rule \
+            --listener-arn $LISTENER_ARN --priority 20 \
+            --conditions '[{"Field":"path-pattern","Values":["/api/despachos*", "/api/v1/despachos*"]}]' \
+            --actions Type=forward,TargetGroupArn=$TG_DESPACHOS_ARN
+
+          echo "Reglas de ruteo del listener listas y actualizadas"
 
       # ----------------------------------------------------------------
       # 8. Crear Cluster ECS
