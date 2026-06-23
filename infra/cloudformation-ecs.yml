@@ -1,0 +1,640 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Infraestructura AWS ECS Fargate 100% automatizada para el proyecto.
+  Crea VPC, Subnets, Internet Gateway, ALB, ECR Repositories, ECS Cluster,
+  ECS Task Definitions, ECS Services y Auto Scaling. Diseñado para AWS Academy (usa LabRole).
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: ep3
+    Description: Prefijo para nombrar los recursos.
+
+  DbVentasEndpoint:
+    Type: String
+    Default: placeholder-db-ventas.rds.amazonaws.com
+    Description: Endpoint de la base de datos MySQL de Ventas.
+
+  DbDespachosEndpoint:
+    Type: String
+    Default: placeholder-db-despachos.rds.amazonaws.com
+    Description: Endpoint de la base de datos MySQL de Despachos.
+
+  DbVentasName:
+    Type: String
+    Default: db_ventas
+    Description: Nombre de la base de datos Ventas.
+
+  DbVentasUser:
+    Type: String
+    Default: user_ventas
+    Description: Usuario de la base de datos Ventas.
+
+  DbVentasPassword:
+    Type: String
+    Default: pass_ventas
+    NoEcho: true
+    Description: Contraseña de la base de datos Ventas.
+
+  DbDespachosName:
+    Type: String
+    Default: db_despachos
+    Description: Nombre de la base de datos Despachos.
+
+  DbDespachosUser:
+    Type: String
+    Default: user_despachos
+    Description: Usuario de la base de datos Despachos.
+
+  DbDespachosPassword:
+    Type: String
+    Default: pass_despachos
+    NoEcho: true
+    Description: Contraseña de la base de datos Despachos.
+
+Resources:
+  # =========================================================================
+  # 1. RED (VPC, Subnets, IGW, Route Table)
+  # =========================================================================
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-vpc
+        - Key: Project
+          Value: !Ref ProjectName
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-igw
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-public-subnet-1
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-public-subnet-2
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-public-rt
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  Subnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  Subnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # =========================================================================
+  # 2. SECURITY GROUPS
+  # =========================================================================
+  SecurityGroupALB:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SG para Load Balancer (HTTP puerto 80)
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-sg-alb
+
+  SecurityGroupFrontend:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SG para Frontend en Fargate (solo trafico desde ALB)
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref SecurityGroupALB
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-sg-frontend
+
+  SecurityGroupBackendVentas:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SG para Backend Ventas en Fargate (solo trafico desde ALB)
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref SecurityGroupALB
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-sg-backend-ventas
+
+  SecurityGroupBackendDespachos:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SG para Backend Despachos en Fargate (solo trafico desde ALB)
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8081
+          ToPort: 8081
+          SourceSecurityGroupId: !Ref SecurityGroupALB
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-sg-backend-despachos
+
+  # =========================================================================
+  # 3. REPOSITORIOS ECR
+  # =========================================================================
+  EcrFrontend:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub ${ProjectName}-frontend
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  EcrBackendVentas:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub ${ProjectName}-backend-ventas
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  EcrBackendDespachos:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub ${ProjectName}-backend-despachos
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # =========================================================================
+  # 4. APPLICATION LOAD BALANCER (ALB)
+  # =========================================================================
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub ${ProjectName}-alb
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref SecurityGroupALB
+      Scheme: internet-facing
+      Type: application
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  TargetGroupFrontend:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${ProjectName}-tg-frontend
+      Protocol: HTTP
+      Port: 80
+      VpcId: !Ref Vpc
+      TargetType: ip
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+
+  TargetGroupBackendVentas:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${ProjectName}-tg-backend-ventas
+      Protocol: HTTP
+      Port: 8080
+      VpcId: !Ref Vpc
+      TargetType: ip
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /api/health
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+
+  TargetGroupBackendDespachos:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${ProjectName}-tg-backend-despachos
+      Protocol: HTTP
+      Port: 8081
+      VpcId: !Ref Vpc
+      TargetType: ip
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /api/health
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroupFrontend
+
+  RuleVentas:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref HttpListener
+      Priority: 10
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - /api/v1/ventas*
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroupBackendVentas
+
+  RuleDespachos:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref HttpListener
+      Priority: 20
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - /api/v1/despachos*
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroupBackendDespachos
+
+  RuleGeneralHealth:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref HttpListener
+      Priority: 5
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - /api/health
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroupBackendVentas
+
+  # =========================================================================
+  # 5. ECS CLUSTER
+  # =========================================================================
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${ProjectName}-cluster
+      CapacityProviders:
+        - FARGATE
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # =========================================================================
+  # 6. LOG GROUPS CLOUDWATCH
+  # =========================================================================
+  LogGroupFrontend:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${ProjectName}/frontend
+      RetentionInDays: 7
+
+  LogGroupBackendVentas:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${ProjectName}/backend-ventas
+      RetentionInDays: 7
+
+  LogGroupBackendDespachos:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${ProjectName}/backend-despachos
+      RetentionInDays: 7
+
+  # =========================================================================
+  # 7. ECS TASK DEFINITIONS (Usa placeholder en la imagen inicial para evitar fallos de creacion)
+  # =========================================================================
+  TaskFrontend:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${ProjectName}-frontend
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: '256'
+      Memory: '512'
+      ExecutionRoleArn: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      TaskRoleArn: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      ContainerDefinitions:
+        - Name: !Sub ${ProjectName}-frontend
+          Image: public.ecr.aws/nginx/nginx:latest  # Placeholder inicial
+          Essential: true
+          PortMappings:
+            - ContainerPort: 80
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroupFrontend
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  TaskBackendVentas:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${ProjectName}-backend-ventas
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: '512'
+      Memory: '1024'
+      ExecutionRoleArn: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      TaskRoleArn: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      ContainerDefinitions:
+        - Name: !Sub ${ProjectName}-backend-ventas
+          Image: public.ecr.aws/docker/library/httpd:latest  # Placeholder inicial
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8080
+              Protocol: tcp
+          Environment:
+            - Name: SERVER_PORT
+              Value: '8080'
+            - Name: DB_ENDPOINT
+              Value: !Ref DbVentasEndpoint
+            - Name: DB_PORT
+              Value: '3306'
+            - Name: DB_NAME
+              Value: !Ref DbVentasName
+            - Name: DB_USERNAME
+              Value: !Ref DbVentasUser
+            - Name: DB_PASSWORD
+              Value: !Ref DbVentasPassword
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroupBackendVentas
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  TaskBackendDespachos:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${ProjectName}-backend-despachos
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: '512'
+      Memory: '1024'
+      ExecutionRoleArn: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      TaskRoleArn: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      ContainerDefinitions:
+        - Name: !Sub ${ProjectName}-backend-despachos
+          Image: public.ecr.aws/docker/library/httpd:latest  # Placeholder inicial
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8081
+              Protocol: tcp
+          Environment:
+            - Name: SERVER_PORT
+              Value: '8081'
+            - Name: DB_ENDPOINT
+              Value: !Ref DbDespachosEndpoint
+            - Name: DB_PORT
+              Value: '3306'
+            - Name: DB_NAME
+              Value: !Ref DbDespachosName
+            - Name: DB_USERNAME
+              Value: !Ref DbDespachosUser
+            - Name: DB_PASSWORD
+              Value: !Ref DbDespachosPassword
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroupBackendDespachos
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  # =========================================================================
+  # 8. SERVICIOS ECS
+  # =========================================================================
+  ServiceFrontend:
+    Type: AWS::ECS::Service
+    DependsOn: HttpListener
+    Properties:
+      Cluster: !Ref EcsCluster
+      ServiceName: !Sub ${ProjectName}-frontend-service
+      TaskDefinition: !Ref TaskFrontend
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets:
+            - !Ref PublicSubnet1
+            - !Ref PublicSubnet2
+          SecurityGroups:
+            - !Ref SecurityGroupFrontend
+          AssignPublicIp: ENABLED
+      LoadBalancers:
+        - TargetGroupArn: !Ref TargetGroupFrontend
+          ContainerName: !Sub ${ProjectName}-frontend
+          ContainerPort: 80
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  ServiceBackendVentas:
+    Type: AWS::ECS::Service
+    DependsOn: HttpListener
+    Properties:
+      Cluster: !Ref EcsCluster
+      ServiceName: !Sub ${ProjectName}-backend-ventas-service
+      TaskDefinition: !Ref TaskBackendVentas
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets:
+            - !Ref PublicSubnet1
+            - !Ref PublicSubnet2
+          SecurityGroups:
+            - !Ref SecurityGroupBackendVentas
+          AssignPublicIp: ENABLED
+      LoadBalancers:
+        - TargetGroupArn: !Ref TargetGroupBackendVentas
+          ContainerName: !Sub ${ProjectName}-backend-ventas
+          ContainerPort: 8080
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  ServiceBackendDespachos:
+    Type: AWS::ECS::Service
+    DependsOn: HttpListener
+    Properties:
+      Cluster: !Ref EcsCluster
+      ServiceName: !Sub ${ProjectName}-backend-despachos-service
+      TaskDefinition: !Ref TaskBackendDespachos
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets:
+            - !Ref PublicSubnet1
+            - !Ref PublicSubnet2
+          SecurityGroups:
+            - !Ref SecurityGroupBackendDespachos
+          AssignPublicIp: ENABLED
+      LoadBalancers:
+        - TargetGroupArn: !Ref TargetGroupBackendDespachos
+          ContainerName: !Sub ${ProjectName}-backend-despachos
+          ContainerPort: 8081
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # =========================================================================
+  # 9. AUTO SCALING (Target Tracking al 50% CPU)
+  # =========================================================================
+  ScalableTargetFrontend:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: 3
+      MinCapacity: 1
+      ResourceId: !Sub service/${EcsCluster}/${ServiceFrontend.ServiceName}
+      RoleARN: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+
+  ScalingPolicyFrontend:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub ${ProjectName}-frontend-cpu-scaling
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ScalableTargetFrontend
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 50.0
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        ScaleOutCooldown: 60
+        ScaleInCooldown: 60
+
+  ScalableTargetBackendVentas:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: 3
+      MinCapacity: 1
+      ResourceId: !Sub service/${EcsCluster}/${ServiceBackendVentas.ServiceName}
+      RoleARN: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+
+  ScalingPolicyBackendVentas:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub ${ProjectName}-backend-ventas-cpu-scaling
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ScalableTargetBackendVentas
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 50.0
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        ScaleOutCooldown: 60
+        ScaleInCooldown: 60
+
+  ScalableTargetBackendDespachos:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: 3
+      MinCapacity: 1
+      ResourceId: !Sub service/${EcsCluster}/${ServiceBackendDespachos.ServiceName}
+      RoleARN: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+
+  ScalingPolicyBackendDespachos:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub ${ProjectName}-backend-despachos-cpu-scaling
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ScalableTargetBackendDespachos
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 50.0
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        ScaleOutCooldown: 60
+        ScaleInCooldown: 60
+
+Outputs:
+  VpcId:
+    Value: !Ref Vpc
+    Description: ID de la VPC creada
+
+  AlbDNSName:
+    Value: !GetAtt LoadBalancer.DNSName
+    Description: DNS Publico del Application Load Balancer
+
+  EcsClusterName:
+    Value: !Ref EcsCluster
+    Description: Nombre del Cluster de ECS creado
