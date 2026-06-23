@@ -1,139 +1,589 @@
-# Levanta la red, grupos de seguridad e instancias en AWS con CloudFormation.
-# Genera y guarda la clave SSH en SSM para los despliegues de la aplicación.
+# Workflow de Infraestructura — Crea todo en AWS desde cero
+# Solo se ejecuta manualmente desde la pestaña Actions
 
-
-name: 'Deploy Infrastructure'
-
+name: Crear Infraestructura AWS ECS Fargate
 
 on:
   workflow_dispatch:
     inputs:
-      instance_type:
-        description: 'Tipo de instancia EC2 (t2.micro = 1GB, t2.small = 2GB)'
-        required: false
-        default: 't2.micro'
-        type: choice
-        options:
-          - t2.micro
-          - t2.small
-
+      proyecto:
+        description: 'Prefijo del proyecto (ej: ep3)'
+        required: true
+        default: 'ep3'
+      region:
+        description: 'Region de AWS'
+        required: true
+        default: 'us-east-1'
 
 env:
-  AWS_REGION: us-east-1
-  STACK_NAME: devops-baeza-laspina
-  KEY_PAIR_NAME: devops-deploy-key
-  SSM_KEY_PARAM: /devops/deploy-key
-
+  PROJECT: ${{ github.event.inputs.proyecto }}
+  AWS_REGION: ${{ github.event.inputs.region }}
 
 jobs:
-  deploy-infrastructure:
-    name: 'Crear Infraestructura AWS'
+  infraestructura:
+    name: Crear Infraestructura Completa
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout codigo
+      # ----------------------------------------------------------------
+      # 1. Checkout del repositorio
+      # ----------------------------------------------------------------
+      - name: Checkout
         uses: actions/checkout@v4
 
-      # Credenciales de AWS (Academy usa tokens temporales)
+      # ----------------------------------------------------------------
+      # 2. Configurar credenciales AWS (soporte para AWS Academy con session token)
+      # ----------------------------------------------------------------
       - name: Configurar credenciales AWS
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-region: ${{ github.event.inputs.region }}
 
-      - name: Verificar conexion AWS
+      # ----------------------------------------------------------------
+      # 3. Verificar conexion con AWS y obtener Account ID
+      # ----------------------------------------------------------------
+      - name: Verificar conexion con AWS
         run: |
-          echo "Verificando identidad AWS..."
-          aws sts get-caller-identity
-          echo ""
-          echo "Region: ${{ env.AWS_REGION }}"
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "Cuenta AWS: $ACCOUNT_ID"
+          echo "ACCOUNT_ID=$ACCOUNT_ID" >> $GITHUB_ENV
 
-      # Crea la clave SSH y la sube a SSM para los despliegues
-      - name: Crear Key Pair SSH
+      # ----------------------------------------------------------------
+      # 4. Crear repositorios ECR (omite si ya existen)
+      # ----------------------------------------------------------------
+      - name: Crear repositorios ECR
         run: |
-          echo "Configurando Key Pair '${{ env.KEY_PAIR_NAME }}'..."
+          for REPO in "${{ env.PROJECT }}-frontend" "${{ env.PROJECT }}-backend-ventas" "${{ env.PROJECT }}-backend-despachos"; do
+            aws ecr describe-repositories --repository-names $REPO --region $AWS_REGION 2>/dev/null || \
+            aws ecr create-repository \
+              --repository-name $REPO \
+              --region $AWS_REGION \
+              --image-scanning-configuration scanOnPush=true \
+              --tags Key=Project,Value=${{ env.PROJECT }}
+            echo "Repositorio $REPO listo"
+          done
 
-          aws ec2 delete-key-pair \
-            --key-name ${{ env.KEY_PAIR_NAME }} 2>/dev/null || true
-
-          aws ec2 create-key-pair \
-            --key-name ${{ env.KEY_PAIR_NAME }} \
-            --query 'KeyMaterial' \
-            --output text > /tmp/key.pem
-
-          # Usamos String normal porque AWS Academy no permite SecureString (KMS)
-          aws ssm put-parameter \
-            --name ${{ env.SSM_KEY_PARAM }} \
-            --type String \
-            --value "$(cat /tmp/key.pem)" \
-            --overwrite
-
-          rm -f /tmp/key.pem
-
-          echo "Key Pair creado y almacenado en SSM Parameter Store"
-
-      - name: Validar template CloudFormation
+      # ----------------------------------------------------------------
+      # 5. Crear VPC, Subnets, Internet Gateway y Route Table
+      # ----------------------------------------------------------------
+      - name: Crear VPC y Red
         run: |
-          echo "Validando template..."
-          aws cloudformation validate-template \
-            --template-body file://infra/cloudformation.yml
-          echo "Template valido"
+          # VPC
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --filters "Name=tag:Name,Values=${{ env.PROJECT }}-vpc" \
+            --query 'Vpcs[0].VpcId' --output text)
 
-      # Crea o actualiza el stack de recursos en AWS
-      - name: Desplegar stack CloudFormation
+          if [ "$VPC_ID" = "None" ] || [ -z "$VPC_ID" ]; then
+            VPC_ID=$(aws ec2 create-vpc \
+              --cidr-block 10.0.0.0/16 \
+              --tag-specifications "ResourceType=vpc,Tags=[{Key=Name,Value=${{ env.PROJECT }}-vpc},{Key=Project,Value=${{ env.PROJECT }}}]" \
+              --query 'Vpc.VpcId' --output text)
+            aws ec2 modify-vpc-attribute --vpc-id $VPC_ID --enable-dns-hostnames '{"Value":true}'
+            echo "VPC creada: $VPC_ID"
+          else
+            echo "VPC ya existe: $VPC_ID"
+          fi
+          echo "VPC_ID=$VPC_ID" >> $GITHUB_ENV
+
+          # Internet Gateway
+          IGW_ID=$(aws ec2 describe-internet-gateways \
+            --filters "Name=tag:Name,Values=${{ env.PROJECT }}-igw" \
+            --query 'InternetGateways[0].InternetGatewayId' --output text)
+
+          if [ "$IGW_ID" = "None" ] || [ -z "$IGW_ID" ]; then
+            IGW_ID=$(aws ec2 create-internet-gateway \
+              --tag-specifications "ResourceType=internet-gateway,Tags=[{Key=Name,Value=${{ env.PROJECT }}-igw}]" \
+              --query 'InternetGateway.InternetGatewayId' --output text)
+            aws ec2 attach-internet-gateway --internet-gateway-id $IGW_ID --vpc-id $VPC_ID
+            echo "IGW creado: $IGW_ID"
+          else
+            echo "IGW ya existe: $IGW_ID"
+          fi
+          echo "IGW_ID=$IGW_ID" >> $GITHUB_ENV
+
+          # Subnet 1 (AZ-a)
+          SUBNET_1_ID=$(aws ec2 describe-subnets \
+            --filters "Name=tag:Name,Values=${{ env.PROJECT }}-public-subnet-1" "Name=vpc-id,Values=$VPC_ID" \
+            --query 'Subnets[0].SubnetId' --output text)
+
+          if [ "$SUBNET_1_ID" = "None" ] || [ -z "$SUBNET_1_ID" ]; then
+            AZ_A=$(aws ec2 describe-availability-zones --region $AWS_REGION --query 'AvailabilityZones[0].ZoneName' --output text)
+            SUBNET_1_ID=$(aws ec2 create-subnet \
+              --vpc-id $VPC_ID --cidr-block 10.0.1.0/24 \
+              --availability-zone $AZ_A \
+              --tag-specifications "ResourceType=subnet,Tags=[{Key=Name,Value=${{ env.PROJECT }}-public-subnet-1}]" \
+              --query 'Subnet.SubnetId' --output text)
+            aws ec2 modify-subnet-attribute --subnet-id $SUBNET_1_ID --map-public-ip-on-launch
+            echo "Subnet 1 creada: $SUBNET_1_ID"
+          else
+            echo "Subnet 1 ya existe: $SUBNET_1_ID"
+          fi
+          echo "SUBNET_1_ID=$SUBNET_1_ID" >> $GITHUB_ENV
+
+          # Subnet 2 (AZ-b)
+          SUBNET_2_ID=$(aws ec2 describe-subnets \
+            --filters "Name=tag:Name,Values=${{ env.PROJECT }}-public-subnet-2" "Name=vpc-id,Values=$VPC_ID" \
+            --query 'Subnets[0].SubnetId' --output text)
+
+          if [ "$SUBNET_2_ID" = "None" ] || [ -z "$SUBNET_2_ID" ]; then
+            AZ_B=$(aws ec2 describe-availability-zones --region $AWS_REGION --query 'AvailabilityZones[1].ZoneName' --output text)
+            SUBNET_2_ID=$(aws ec2 create-subnet \
+              --vpc-id $VPC_ID --cidr-block 10.0.2.0/24 \
+              --availability-zone $AZ_B \
+              --tag-specifications "ResourceType=subnet,Tags=[{Key=Name,Value=${{ env.PROJECT }}-public-subnet-2}]" \
+              --query 'Subnet.SubnetId' --output text)
+            aws ec2 modify-subnet-attribute --subnet-id $SUBNET_2_ID --map-public-ip-on-launch
+            echo "Subnet 2 creada: $SUBNET_2_ID"
+          else
+            echo "Subnet 2 ya existe: $SUBNET_2_ID"
+          fi
+          echo "SUBNET_2_ID=$SUBNET_2_ID" >> $GITHUB_ENV
+
+          # Route Table
+          RTB_ID=$(aws ec2 describe-route-tables \
+            --filters "Name=tag:Name,Values=${{ env.PROJECT }}-public-rt" "Name=vpc-id,Values=$VPC_ID" \
+            --query 'RouteTables[0].RouteTableId' --output text)
+
+          if [ "$RTB_ID" = "None" ] || [ -z "$RTB_ID" ]; then
+            RTB_ID=$(aws ec2 create-route-table \
+              --vpc-id $VPC_ID \
+              --tag-specifications "ResourceType=route-table,Tags=[{Key=Name,Value=${{ env.PROJECT }}-public-rt}]" \
+              --query 'RouteTable.RouteTableId' --output text)
+            aws ec2 create-route --route-table-id $RTB_ID --destination-cidr-block 0.0.0.0/0 --gateway-id $IGW_ID
+            aws ec2 associate-route-table --subnet-id $SUBNET_1_ID --route-table-id $RTB_ID
+            aws ec2 associate-route-table --subnet-id $SUBNET_2_ID --route-table-id $RTB_ID
+            echo "Route Table creada: $RTB_ID"
+          else
+            echo "Route Table ya existe: $RTB_ID"
+          fi
+          echo "Red lista — VPC: $VPC_ID | Subnets: $SUBNET_1_ID $SUBNET_2_ID"
+
+      # ----------------------------------------------------------------
+      # 6. Crear Security Groups
+      # ----------------------------------------------------------------
+      - name: Crear Security Groups
         run: |
-          echo "Desplegando infraestructura..."
-          echo "   Stack: ${{ env.STACK_NAME }}"
-          echo "   Instancias: ${{ github.event.inputs.instance_type || 't2.micro' }}"
-          echo ""
+          # SG ALB
+          SG_ALB_ID=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=${{ env.PROJECT }}-sg-alb" "Name=vpc-id,Values=$VPC_ID" \
+            --query 'SecurityGroups[0].GroupId' --output text)
+          if [ "$SG_ALB_ID" = "None" ] || [ -z "$SG_ALB_ID" ]; then
+            SG_ALB_ID=$(aws ec2 create-security-group \
+              --group-name ${{ env.PROJECT }}-sg-alb \
+              --description "SG ALB - permite HTTP desde Internet" \
+              --vpc-id $VPC_ID \
+              --tag-specifications "ResourceType=security-group,Tags=[{Key=Name,Value=${{ env.PROJECT }}-sg-alb}]" \
+              --query 'GroupId' --output text)
+            aws ec2 authorize-security-group-ingress --group-id $SG_ALB_ID --protocol tcp --port 80 --cidr 0.0.0.0/0
+          fi
+          echo "SG_ALB_ID=$SG_ALB_ID" >> $GITHUB_ENV
+          echo "SG ALB: $SG_ALB_ID"
 
-          aws cloudformation deploy \
-            --template-file infra/cloudformation.yml \
-            --stack-name ${{ env.STACK_NAME }} \
-            --parameter-overrides \
-              KeyPairName=${{ env.KEY_PAIR_NAME }} \
-              InstanceType=${{ github.event.inputs.instance_type || 't2.micro' }} \
-            --no-fail-on-empty-changeset \
-            --tags \
-              Project=devops-baeza-laspina \
-              Environment=sandbox
+          # SG Frontend
+          SG_FRONTEND_ID=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=${{ env.PROJECT }}-sg-frontend" "Name=vpc-id,Values=$VPC_ID" \
+            --query 'SecurityGroups[0].GroupId' --output text)
+          if [ "$SG_FRONTEND_ID" = "None" ] || [ -z "$SG_FRONTEND_ID" ]; then
+            SG_FRONTEND_ID=$(aws ec2 create-security-group \
+              --group-name ${{ env.PROJECT }}-sg-frontend \
+              --description "SG Frontend Fargate - solo trafico del ALB" \
+              --vpc-id $VPC_ID \
+              --tag-specifications "ResourceType=security-group,Tags=[{Key=Name,Value=${{ env.PROJECT }}-sg-frontend}]" \
+              --query 'GroupId' --output text)
+            aws ec2 authorize-security-group-ingress --group-id $SG_FRONTEND_ID --protocol tcp --port 80 --source-group $SG_ALB_ID
+          fi
+          echo "SG_FRONTEND_ID=$SG_FRONTEND_ID" >> $GITHUB_ENV
+          echo "SG Frontend: $SG_FRONTEND_ID"
 
-          echo ""
-          echo "Infraestructura desplegada exitosamente"
+          # SG Backend Ventas
+          SG_VENTAS_ID=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=${{ env.PROJECT }}-sg-backend-ventas" "Name=vpc-id,Values=$VPC_ID" \
+            --query 'SecurityGroups[0].GroupId' --output text)
+          if [ "$SG_VENTAS_ID" = "None" ] || [ -z "$SG_VENTAS_ID" ]; then
+            SG_VENTAS_ID=$(aws ec2 create-security-group \
+              --group-name ${{ env.PROJECT }}-sg-backend-ventas \
+              --description "SG Backend Ventas Fargate - solo trafico del ALB" \
+              --vpc-id $VPC_ID \
+              --tag-specifications "ResourceType=security-group,Tags=[{Key=Name,Value=${{ env.PROJECT }}-sg-backend-ventas}]" \
+              --query 'GroupId' --output text)
+            aws ec2 authorize-security-group-ingress --group-id $SG_VENTAS_ID --protocol tcp --port 8080 --source-group $SG_ALB_ID
+          fi
+          echo "SG_VENTAS_ID=$SG_VENTAS_ID" >> $GITHUB_ENV
+          echo "SG Backend Ventas: $SG_VENTAS_ID"
 
-      - name: Mostrar IPs de las instancias
+          # SG Backend Despachos
+          SG_DESPACHOS_ID=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=${{ env.PROJECT }}-sg-backend-despachos" "Name=vpc-id,Values=$VPC_ID" \
+            --query 'SecurityGroups[0].GroupId' --output text)
+          if [ "$SG_DESPACHOS_ID" = "None" ] || [ -z "$SG_DESPACHOS_ID" ]; then
+            SG_DESPACHOS_ID=$(aws ec2 create-security-group \
+              --group-name ${{ env.PROJECT }}-sg-backend-despachos \
+              --description "SG Backend Despachos Fargate - solo trafico del ALB" \
+              --vpc-id $VPC_ID \
+              --tag-specifications "ResourceType=security-group,Tags=[{Key=Name,Value=${{ env.PROJECT }}-sg-backend-despachos}]" \
+              --query 'GroupId' --output text)
+            aws ec2 authorize-security-group-ingress --group-id $SG_DESPACHOS_ID --protocol tcp --port 8081 --source-group $SG_ALB_ID
+          fi
+          echo "SG_DESPACHOS_ID=$SG_DESPACHOS_ID" >> $GITHUB_ENV
+          echo "SG Backend Despachos: $SG_DESPACHOS_ID"
+
+      # ----------------------------------------------------------------
+      # 7. Crear Application Load Balancer y Target Groups
+      # ----------------------------------------------------------------
+      - name: Crear ALB y Target Groups
         run: |
-          echo "============================================"
-          echo "  INFRAESTRUCTURA CREADA"
-          echo "============================================"
-          echo ""
+          # ALB
+          ALB_ARN=$(aws elbv2 describe-load-balancers \
+            --names ${{ env.PROJECT }}-alb \
+            --query 'LoadBalancers[0].LoadBalancerArn' --output text 2>/dev/null || echo "None")
 
-          get_output() {
-            aws cloudformation describe-stacks \
-              --stack-name ${{ env.STACK_NAME }} \
-              --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" \
-              --output text
-          }
+          if [ "$ALB_ARN" = "None" ] || [ -z "$ALB_ARN" ]; then
+            ALB_ARN=$(aws elbv2 create-load-balancer \
+              --name ${{ env.PROJECT }}-alb \
+              --subnets $SUBNET_1_ID $SUBNET_2_ID \
+              --security-groups $SG_ALB_ID \
+              --scheme internet-facing --type application \
+              --tags Key=Project,Value=${{ env.PROJECT }} \
+              --query 'LoadBalancers[0].LoadBalancerArn' --output text)
+            echo "ALB creado"
+          else
+            echo "ALB ya existe"
+          fi
+          echo "ALB_ARN=$ALB_ARN" >> $GITHUB_ENV
 
-          FRONTEND_IP=$(get_output FrontendPublicIP)
-          BV_PUBLIC=$(get_output BackendVentasPublicIP)
-          BV_PRIVATE=$(get_output BackendVentasPrivateIP)
-          BD_PUBLIC=$(get_output BackendDespachosPublicIP)
-          BD_PRIVATE=$(get_output BackendDespachosPrivateIP)
-          DBV_PUBLIC=$(get_output MySQLVentasPublicIP)
-          DBV_PRIVATE=$(get_output MySQLVentasPrivateIP)
-          DBD_PUBLIC=$(get_output MySQLDespachosPublicIP)
-          DBD_PRIVATE=$(get_output MySQLDespachosPrivateIP)
+          ALB_DNS=$(aws elbv2 describe-load-balancers \
+            --load-balancer-arns $ALB_ARN \
+            --query 'LoadBalancers[0].DNSName' --output text)
+          echo "ALB_DNS=$ALB_DNS" >> $GITHUB_ENV
+          echo "ALB DNS: $ALB_DNS"
 
-          echo "Frontend:           $FRONTEND_IP (publico)"
-          echo "Backend Ventas:     $BV_PUBLIC (publico) / $BV_PRIVATE (privado)"
-          echo "Backend Despachos:  $BD_PUBLIC (publico) / $BD_PRIVATE (privado)"
-          echo "MySQL Ventas:       $DBV_PUBLIC (publico) / $DBV_PRIVATE (privado)"
-          echo "MySQL Despachos:    $DBD_PUBLIC (publico) / $DBD_PRIVATE (privado)"
+          # Target Group Frontend
+          TG_FRONTEND_ARN=$(aws elbv2 describe-target-groups \
+            --names ${{ env.PROJECT }}-tg-frontend \
+            --query 'TargetGroups[0].TargetGroupArn' --output text 2>/dev/null || echo "None")
+          if [ "$TG_FRONTEND_ARN" = "None" ] || [ -z "$TG_FRONTEND_ARN" ]; then
+            TG_FRONTEND_ARN=$(aws elbv2 create-target-group \
+              --name ${{ env.PROJECT }}-tg-frontend \
+              --protocol HTTP --port 80 --vpc-id $VPC_ID --target-type ip \
+              --health-check-path /health \
+              --health-check-interval-seconds 30 --health-check-timeout-seconds 5 \
+              --healthy-threshold-count 2 --unhealthy-threshold-count 3 \
+              --query 'TargetGroups[0].TargetGroupArn' --output text)
+          fi
+          echo "TG_FRONTEND_ARN=$TG_FRONTEND_ARN" >> $GITHUB_ENV
+
+          # Target Group Backend Ventas
+          TG_VENTAS_ARN=$(aws elbv2 describe-target-groups \
+            --names ${{ env.PROJECT }}-tg-backend-ventas \
+            --query 'TargetGroups[0].TargetGroupArn' --output text 2>/dev/null || echo "None")
+          if [ "$TG_VENTAS_ARN" = "None" ] || [ -z "$TG_VENTAS_ARN" ]; then
+            TG_VENTAS_ARN=$(aws elbv2 create-target-group \
+              --name ${{ env.PROJECT }}-tg-backend-ventas \
+              --protocol HTTP --port 8080 --vpc-id $VPC_ID --target-type ip \
+              --health-check-path /api/health \
+              --health-check-interval-seconds 30 --health-check-timeout-seconds 5 \
+              --healthy-threshold-count 2 --unhealthy-threshold-count 3 \
+              --query 'TargetGroups[0].TargetGroupArn' --output text)
+          fi
+          echo "TG_VENTAS_ARN=$TG_VENTAS_ARN" >> $GITHUB_ENV
+
+          # Target Group Backend Despachos
+          TG_DESPACHOS_ARN=$(aws elbv2 describe-target-groups \
+            --names ${{ env.PROJECT }}-tg-backend-despachos \
+            --query 'TargetGroups[0].TargetGroupArn' --output text 2>/dev/null || echo "None")
+          if [ "$TG_DESPACHOS_ARN" = "None" ] || [ -z "$TG_DESPACHOS_ARN" ]; then
+            TG_DESPACHOS_ARN=$(aws elbv2 create-target-group \
+              --name ${{ env.PROJECT }}-tg-backend-despachos \
+              --protocol HTTP --port 8081 --vpc-id $VPC_ID --target-type ip \
+              --health-check-path /api/health \
+              --health-check-interval-seconds 30 --health-check-timeout-seconds 5 \
+              --healthy-threshold-count 2 --unhealthy-threshold-count 3 \
+              --query 'TargetGroups[0].TargetGroupArn' --output text)
+          fi
+          echo "TG_DESPACHOS_ARN=$TG_DESPACHOS_ARN" >> $GITHUB_ENV
+
+          # Listener HTTP:80 con reglas de ruteo por path
+          LISTENER_ARN=$(aws elbv2 describe-listeners \
+            --load-balancer-arn $ALB_ARN \
+            --query 'Listeners[?Port==`80`].ListenerArn' --output text)
+
+          if [ -z "$LISTENER_ARN" ]; then
+            LISTENER_ARN=$(aws elbv2 create-listener \
+              --load-balancer-arn $ALB_ARN \
+              --protocol HTTP --port 80 \
+              --default-actions Type=forward,TargetGroupArn=$TG_FRONTEND_ARN \
+              --query 'Listeners[0].ListenerArn' --output text)
+
+            aws elbv2 create-rule \
+              --listener-arn $LISTENER_ARN --priority 5 \
+              --conditions '[{"Field":"path-pattern","Values":["/api/health"]}]' \
+              --actions Type=forward,TargetGroupArn=$TG_VENTAS_ARN
+
+            aws elbv2 create-rule \
+              --listener-arn $LISTENER_ARN --priority 10 \
+              --conditions '[{"Field":"path-pattern","Values":["/api/v1/ventas*"]}]' \
+              --actions Type=forward,TargetGroupArn=$TG_VENTAS_ARN
+
+            aws elbv2 create-rule \
+              --listener-arn $LISTENER_ARN --priority 20 \
+              --conditions '[{"Field":"path-pattern","Values":["/api/v1/despachos*"]}]' \
+              --actions Type=forward,TargetGroupArn=$TG_DESPACHOS_ARN
+
+            echo "Listener y reglas creadas"
+          else
+            echo "Listener ya existe: $LISTENER_ARN"
+          fi
+          echo "LISTENER_ARN=$LISTENER_ARN" >> $GITHUB_ENV
+
+      # ----------------------------------------------------------------
+      # 8. Crear Cluster ECS
+      # ----------------------------------------------------------------
+      - name: Crear Cluster ECS
+        run: |
+          ECS_CLUSTER_NAME="${{ env.PROJECT }}-cluster"
+          CLUSTER_STATUS=$(aws ecs describe-clusters \
+            --clusters $ECS_CLUSTER_NAME \
+            --query 'clusters[0].status' --output text 2>/dev/null)
+
+          if [ "$CLUSTER_STATUS" != "ACTIVE" ]; then
+            aws ecs create-cluster \
+              --cluster-name $ECS_CLUSTER_NAME \
+              --capacity-providers FARGATE \
+              --default-capacity-provider-strategy capacityProvider=FARGATE,weight=1 \
+              --tags key=Project,value=${{ env.PROJECT }}
+            echo "Cluster ECS creado: $ECS_CLUSTER_NAME"
+          else
+            echo "Cluster ya existe y está activo: $ECS_CLUSTER_NAME"
+          fi
+          echo "ECS_CLUSTER=$ECS_CLUSTER_NAME" >> $GITHUB_ENV
+
+      # ----------------------------------------------------------------
+      # 9. Crear Log Groups en CloudWatch
+      # ----------------------------------------------------------------
+      - name: Crear Log Groups en CloudWatch
+        run: |
+          for LOG_GROUP in \
+            "/ecs/${{ env.PROJECT }}/frontend" \
+            "/ecs/${{ env.PROJECT }}/backend-ventas" \
+            "/ecs/${{ env.PROJECT }}/backend-despachos"; do
+            aws logs describe-log-groups --log-group-name-prefix "$LOG_GROUP" \
+              --query 'logGroups[0].logGroupName' --output text | grep -q "$LOG_GROUP" || \
+            aws logs create-log-group \
+              --log-group-name "$LOG_GROUP" \
+              --tags Project=${{ env.PROJECT }}
+            echo "Log Group listo: $LOG_GROUP"
+          done
+
+      # ----------------------------------------------------------------
+      # 10. Registrar Task Definitions en ECS
+      # ----------------------------------------------------------------
+      - name: Registrar Task Definitions
+        run: |
+          ECR_BASE="${{ env.ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
+          LAB_ROLE="arn:aws:iam::${{ env.ACCOUNT_ID }}:role/LabRole"
+
+          # Task Definition Frontend
+          aws ecs register-task-definition --cli-input-json "{
+            \"family\": \"${{ env.PROJECT }}-frontend\",
+            \"networkMode\": \"awsvpc\",
+            \"requiresCompatibilities\": [\"FARGATE\"],
+            \"cpu\": \"256\",
+            \"memory\": \"512\",
+            \"executionRoleArn\": \"$LAB_ROLE\",
+            \"taskRoleArn\": \"$LAB_ROLE\",
+            \"containerDefinitions\": [{
+              \"name\": \"${{ env.PROJECT }}-frontend\",
+              \"image\": \"$ECR_BASE/${{ env.PROJECT }}-frontend:latest\",
+              \"essential\": true,
+              \"portMappings\": [{\"containerPort\": 80, \"protocol\": \"tcp\"}],
+              \"logConfiguration\": {
+                \"logDriver\": \"awslogs\",
+                \"options\": {
+                  \"awslogs-group\": \"/ecs/${{ env.PROJECT }}/frontend\",
+                  \"awslogs-region\": \"${{ env.AWS_REGION }}\",
+                  \"awslogs-stream-prefix\": \"ecs\"
+                }
+              }
+            }]
+          }"
+          echo "Task Definition Frontend registrada"
+
+          # Task Definition Backend Ventas
+          aws ecs register-task-definition --cli-input-json "{
+            \"family\": \"${{ env.PROJECT }}-backend-ventas\",
+            \"networkMode\": \"awsvpc\",
+            \"requiresCompatibilities\": [\"FARGATE\"],
+            \"cpu\": \"512\",
+            \"memory\": \"1024\",
+            \"executionRoleArn\": \"$LAB_ROLE\",
+            \"taskRoleArn\": \"$LAB_ROLE\",
+            \"containerDefinitions\": [{
+              \"name\": \"${{ env.PROJECT }}-backend-ventas\",
+              \"image\": \"$ECR_BASE/${{ env.PROJECT }}-backend-ventas:latest\",
+              \"essential\": true,
+              \"portMappings\": [{\"containerPort\": 8080, \"protocol\": \"tcp\"}],
+              \"environment\": [{\"name\": \"SERVER_PORT\", \"value\": \"8080\"}],
+              \"logConfiguration\": {
+                \"logDriver\": \"awslogs\",
+                \"options\": {
+                  \"awslogs-group\": \"/ecs/${{ env.PROJECT }}/backend-ventas\",
+                  \"awslogs-region\": \"${{ env.AWS_REGION }}\",
+                  \"awslogs-stream-prefix\": \"ecs\"
+                }
+              }
+            }]
+          }"
+          echo "Task Definition Backend Ventas registrada"
+
+          # Task Definition Backend Despachos
+          aws ecs register-task-definition --cli-input-json "{
+            \"family\": \"${{ env.PROJECT }}-backend-despachos\",
+            \"networkMode\": \"awsvpc\",
+            \"requiresCompatibilities\": [\"FARGATE\"],
+            \"cpu\": \"512\",
+            \"memory\": \"1024\",
+            \"executionRoleArn\": \"$LAB_ROLE\",
+            \"taskRoleArn\": \"$LAB_ROLE\",
+            \"containerDefinitions\": [{
+              \"name\": \"${{ env.PROJECT }}-backend-despachos\",
+              \"image\": \"$ECR_BASE/${{ env.PROJECT }}-backend-despachos:latest\",
+              \"essential\": true,
+              \"portMappings\": [{\"containerPort\": 8081, \"protocol\": \"tcp\"}],
+              \"environment\": [{\"name\": \"SERVER_PORT\", \"value\": \"8081\"}],
+              \"logConfiguration\": {
+                \"logDriver\": \"awslogs\",
+                \"options\": {
+                  \"awslogs-group\": \"/ecs/${{ env.PROJECT }}/backend-despachos\",
+                  \"awslogs-region\": \"${{ env.AWS_REGION }}\",
+                  \"awslogs-stream-prefix\": \"ecs\"
+                }
+              }
+            }]
+          }"
+          echo "Task Definition Backend Despachos registrada"
+
+      # ----------------------------------------------------------------
+      # 11. Crear Servicios ECS con Fargate
+      # ----------------------------------------------------------------
+      - name: Crear Servicios ECS
+        run: |
+          NETWORK_CONFIG="awsvpcConfiguration={subnets=[$SUBNET_1_ID,$SUBNET_2_ID],securityGroups=[$SG_FRONTEND_ID],assignPublicIp=ENABLED}"
+
+          # Servicio Frontend
+          SVC_STATUS=$(aws ecs describe-services --cluster $ECS_CLUSTER \
+            --services ${{ env.PROJECT }}-frontend-service \
+            --query 'services[0].status' --output text 2>/dev/null)
+
+          if [ "$SVC_STATUS" != "ACTIVE" ]; then
+            aws ecs create-service \
+              --cluster $ECS_CLUSTER \
+              --service-name ${{ env.PROJECT }}-frontend-service \
+              --task-definition ${{ env.PROJECT }}-frontend \
+              --desired-count 1 \
+              --launch-type FARGATE \
+              --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_1_ID,$SUBNET_2_ID],securityGroups=[$SG_FRONTEND_ID],assignPublicIp=ENABLED}" \
+              --load-balancers "targetGroupArn=$TG_FRONTEND_ARN,containerName=${{ env.PROJECT }}-frontend,containerPort=80" \
+              --tags key=Project,value=${{ env.PROJECT }}
+            echo "Servicio Frontend creado"
+          else
+            echo "Servicio Frontend ya existe"
+          fi
+
+          # Servicio Backend Ventas
+          SVC_STATUS=$(aws ecs describe-services --cluster $ECS_CLUSTER \
+            --services ${{ env.PROJECT }}-backend-ventas-service \
+            --query 'services[0].status' --output text 2>/dev/null)
+
+          if [ "$SVC_STATUS" != "ACTIVE" ]; then
+            aws ecs create-service \
+              --cluster $ECS_CLUSTER \
+              --service-name ${{ env.PROJECT }}-backend-ventas-service \
+              --task-definition ${{ env.PROJECT }}-backend-ventas \
+              --desired-count 1 \
+              --launch-type FARGATE \
+              --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_1_ID,$SUBNET_2_ID],securityGroups=[$SG_VENTAS_ID],assignPublicIp=ENABLED}" \
+              --load-balancers "targetGroupArn=$TG_VENTAS_ARN,containerName=${{ env.PROJECT }}-backend-ventas,containerPort=8080" \
+              --tags key=Project,value=${{ env.PROJECT }}
+            echo "Servicio Backend Ventas creado"
+          else
+            echo "Servicio Backend Ventas ya existe"
+          fi
+
+          # Servicio Backend Despachos
+          SVC_STATUS=$(aws ecs describe-services --cluster $ECS_CLUSTER \
+            --services ${{ env.PROJECT }}-backend-despachos-service \
+            --query 'services[0].status' --output text 2>/dev/null)
+
+          if [ "$SVC_STATUS" != "ACTIVE" ]; then
+            aws ecs create-service \
+              --cluster $ECS_CLUSTER \
+              --service-name ${{ env.PROJECT }}-backend-despachos-service \
+              --task-definition ${{ env.PROJECT }}-backend-despachos \
+              --desired-count 1 \
+              --launch-type FARGATE \
+              --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_1_ID,$SUBNET_2_ID],securityGroups=[$SG_DESPACHOS_ID],assignPublicIp=ENABLED}" \
+              --load-balancers "targetGroupArn=$TG_DESPACHOS_ARN,containerName=${{ env.PROJECT }}-backend-despachos,containerPort=8081" \
+              --tags key=Project,value=${{ env.PROJECT }}
+            echo "Servicio Backend Despachos creado"
+          else
+            echo "Servicio Backend Despachos ya existe"
+          fi
+
+      # ----------------------------------------------------------------
+      # 12. Configurar Auto Scaling en los Servicios
+      # ----------------------------------------------------------------
+      - name: Configurar Auto Scaling
+        run: |
+          for SVC in "frontend-service" "backend-ventas-service" "backend-despachos-service"; do
+            aws application-autoscaling register-scalable-target \
+              --service-namespace ecs \
+              --scalable-dimension ecs:service:DesiredCount \
+              --resource-id "service/$ECS_CLUSTER/${{ env.PROJECT }}-$SVC" \
+              --min-capacity 1 \
+              --max-capacity 3 2>/dev/null || true
+
+            aws application-autoscaling put-scaling-policy \
+              --service-namespace ecs \
+              --scalable-dimension ecs:service:DesiredCount \
+              --resource-id "service/$ECS_CLUSTER/${{ env.PROJECT }}-$SVC" \
+              --policy-name "${{ env.PROJECT }}-$SVC-cpu-scaling" \
+              --policy-type TargetTrackingScaling \
+              --target-tracking-scaling-policy-configuration '{
+                "TargetValue": 50.0,
+                "PredefinedMetricSpecification": {"PredefinedMetricType": "ECSServiceAverageCPUUtilization"},
+                "ScaleOutCooldown": 60,
+                "ScaleInCooldown": 60
+              }' 2>/dev/null || true
+
+            echo "Auto Scaling configurado para $SVC"
+          done
+
+      # ----------------------------------------------------------------
+      # 13. Resumen final con todos los valores creados
+      # ----------------------------------------------------------------
+      - name: Resumen de Infraestructura Creada
+        run: |
+          echo "============================================================"
+          echo "  INFRAESTRUCTURA CREADA EXITOSAMENTE"
+          echo "============================================================"
           echo ""
-          echo "URL de la aplicación: http://$FRONTEND_IP"
+          echo "--- Copia estos valores a tus GitHub Secrets ---"
           echo ""
-          echo "Siguiente paso: ejecuta el workflow 'Deploy Application'"
-          echo "============================================"
+          echo "AWS_ACCOUNT_ID=${{ env.ACCOUNT_ID }}"
+          echo "AWS_REGION=${{ env.AWS_REGION }}"
+          echo "ECS_CLUSTER=$ECS_CLUSTER"
+          echo ""
+          echo "ECS_FRONTEND_SERVICE=${{ env.PROJECT }}-frontend-service"
+          echo "ECS_BACKEND_VENTAS_SERVICE=${{ env.PROJECT }}-backend-ventas-service"
+          echo "ECS_BACKEND_DESPACHOS_SERVICE=${{ env.PROJECT }}-backend-despachos-service"
+          echo ""
+          echo "ECR_FRONTEND_REPOSITORY=${{ env.PROJECT }}-frontend"
+          echo "ECR_BACKEND_VENTAS_REPOSITORY=${{ env.PROJECT }}-backend-ventas"
+          echo "ECR_BACKEND_DESPACHOS_REPOSITORY=${{ env.PROJECT }}-backend-despachos"
+          echo ""
+          echo "--- URL de acceso a la aplicacion ---"
+          echo "URL: http://$ALB_DNS"
+          echo "============================================================"
